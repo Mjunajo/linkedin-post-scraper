@@ -6,56 +6,48 @@ on:
   workflow_dispatch:        # Manual trigger from Actions tab
 
 permissions:
-  contents: write
+  contents: write           # To commit posts.json
 
 jobs:
   scrape-linkedin:
-    runs-on: ubuntu-22.04   # Pinned — 24.04 breaks Playwright's libasound2 dep
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python ─────────────────────────────────────────────────────────
       - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. Python packages ─────────────────────────────────────────────────
       - name: 📦 Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Playwright browser ──────────────────────────────────────────────
       - name: 🌐 Install Playwright + Chromium
         run: |
           playwright install chromium
           playwright install-deps chromium
 
-      # ── 5. Run scraper ─────────────────────────────────────────────────────
       - name: 🔍 Run LinkedIn scraper
         env:
-          LINKEDIN_EMAIL:       ${{ secrets.LINKEDIN_EMAIL }}
-          LINKEDIN_PASSWORD:    ${{ secrets.LINKEDIN_PASSWORD }}
+          LINKEDIN_LI_AT:       ${{ secrets.LINKEDIN_LI_AT }}
           LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
+          GH_PAT:               ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY:    ${{ github.repository }}   # auto-provided
         run: python scraper.py
 
-      # ── 6. Upload debug screenshots (always, even on failure) ──────────────
-      #    If the scraper fails you can download these from the Actions run page
-      #    to see exactly what the browser was looking at.
       - name: 📸 Upload debug screenshots
-        if: always()   # Run this step even if scraper failed
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
           path: "*.png"
-          if-no-files-found: ignore   # Don't fail if no screenshots exist
-          retention-days: 3           # Auto-delete after 3 days
+          if-no-files-found: ignore
+          retention-days: 3
 
-      # ── 7. Commit updated posts.json ───────────────────────────────────────
       - name: 💾 Commit updated posts.json
         run: |
           git config user.name  "github-actions[bot]"
