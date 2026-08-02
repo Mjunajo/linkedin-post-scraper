@@ -11,7 +11,7 @@ permissions:
 jobs:
   scrape-linkedin:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 5
 
     steps:
       - name: 📥 Checkout repository
@@ -26,11 +26,6 @@ jobs:
       - name: 📦 Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: 🌐 Install Playwright + Chromium
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
-
       - name: 🔍 Run LinkedIn scraper
         env:
           LINKEDIN_LI_AT:       ${{ secrets.LINKEDIN_LI_AT }}
@@ -38,19 +33,6 @@ jobs:
           GH_PAT:               ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY:    ${{ github.repository }}
         run: python scraper.py
-
-      - name: 📸 Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-artifacts
-          path: |
-            *.png
-            *.html
-            *.txt
-            *.json
-          if-no-files-found: ignore
-          retention-days: 3
 
       - name: 💾 Commit updated posts.json
         run: |
