@@ -4,7 +4,7 @@ import random
 import os
 import base64
 import re
-import requests as req_lib
+import requests
 from nacl import encoding, public as nacl_public
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -17,18 +17,18 @@ GH_PAT               = os.environ.get("GH_PAT", "")
 GITHUB_REPOSITORY    = os.environ.get("GITHUB_REPOSITORY", "")
 # ──────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_TIMEOUT = 60_000
+DEFAULT_TIMEOUT = 60_000  # ms
 
 
 # ═══════════════════════════════════════════════════════════════
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════
 
-def human_delay(min_s=2.0, max_s=5.0):
+def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
 
-def save_debug_screenshot(page, name):
+def save_debug_screenshot(page, name: str) -> None:
     try:
         page.screenshot(path=f"{name}.png", full_page=True)
         print(f"   📸 {name}.png")
@@ -36,7 +36,7 @@ def save_debug_screenshot(page, name):
         print(f"   ⚠️  Screenshot failed: {e}")
 
 
-def print_page_info(page, label=""):
+def print_page_info(page, label: str = "") -> None:
     try:
         print(f"   [{label}] URL:   {page.url}")
         print(f"   [{label}] Title: {page.title()}")
@@ -44,7 +44,7 @@ def print_page_info(page, label=""):
         pass
 
 
-def extract_username_from_url(url):
+def extract_username_from_url(url: str) -> str:
     match = re.search(r'linkedin\.com/in/([^/?#]+)', url)
     return match.group(1).strip('/') if match else ""
 
@@ -53,13 +53,13 @@ def extract_username_from_url(url):
 # GITHUB SECRET AUTO-REFRESH
 # ═══════════════════════════════════════════════════════════════
 
-def _encrypt_secret(pub_key_b64, value):
+def _encrypt_secret(pub_key_b64: str, value: str) -> str:
     pk  = nacl_public.PublicKey(pub_key_b64.encode(), encoding.Base64Encoder())
     box = nacl_public.SealedBox(pk)
     return base64.b64encode(box.encrypt(value.encode())).decode()
 
 
-def refresh_github_secret(secret_name, new_value):
+def refresh_github_secret(secret_name: str, new_value: str) -> bool:
     if not GH_PAT or not GITHUB_REPOSITORY:
         return False
     headers = {
@@ -68,11 +68,11 @@ def refresh_github_secret(secret_name, new_value):
         "X-GitHub-Api-Version": "2022-11-28",
     }
     base = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets"
-    kr   = req_lib.get(f"{base}/public-key", headers=headers, timeout=10)
+    kr   = requests.get(f"{base}/public-key", headers=headers, timeout=10)
     if kr.status_code != 200:
         return False
     kd   = kr.json()
-    resp = req_lib.put(
+    resp = requests.put(
         f"{base}/{secret_name}",
         headers=headers,
         json={"encrypted_value": _encrypt_secret(kd["key"], new_value), "key_id": kd["key_id"]},
@@ -84,7 +84,7 @@ def refresh_github_secret(secret_name, new_value):
     return False
 
 
-def extract_fresh_li_at(context):
+def extract_fresh_li_at(context) -> str:
     for c in context.cookies():
         if c["name"] == "li_at" and "linkedin.com" in c.get("domain", ""):
             return c["value"]
@@ -92,434 +92,372 @@ def extract_fresh_li_at(context):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SESSION
+# SESSION SETUP
 # ═══════════════════════════════════════════════════════════════
 
-def inject_session_cookie(context):
+def inject_session_cookie(context) -> None:
     context.add_cookies([{
-        "name": "li_at", "value": LI_AT_COOKIE,
-        "domain": ".linkedin.com", "path": "/",
-        "httpOnly": True, "secure": True, "sameSite": "None",
+        "name":     "li_at",
+        "value":    LI_AT_COOKIE,
+        "domain":   ".linkedin.com",
+        "path":     "/",
+        "httpOnly": True,
+        "secure":   True,
+        "sameSite": "None",
     }])
     print("   ✅ Session cookie injected")
 
 
-def load_linkedin_feed(page):
-    """
-    Load the LinkedIn feed page and verify the session is active.
-    We stay on the feed page (NOT about:blank) so we can make
-    Voyager API calls from within the authenticated LinkedIn context.
-    """
-    print("   Loading LinkedIn feed …")
+def verify_and_warmup_session(page) -> None:
+    print("   Verifying session on feed page …")
     try:
         page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
     except Exception as e:
         if "ERR_TOO_MANY_REDIRECTS" in str(e):
-            raise RuntimeError("❌ Cookie INVALID/REVOKED — get a fresh li_at from your throwaway account.") from None
+            raise RuntimeError("❌ Cookie is INVALID or REVOKED. Update LINKEDIN_LI_AT in GitHub Secrets.") from None
         raise
 
-    human_delay(4, 7)
-    print_page_info(page, "feed")
-    save_debug_screenshot(page, "01_feed")
+    human_delay(3, 5)
+    print_page_info(page, "feed-check")
+    save_debug_screenshot(page, "01_feed_check")
 
     url = page.url
-    if "login" in url or "authwall" in url:
-        raise RuntimeError("❌ Cookie EXPIRED — get a fresh li_at from your throwaway account.")
+    if "login" in url or "authwall" in url or "signup" in url:
+        raise RuntimeError("❌ Cookie has EXPIRED. Get a fresh li_at cookie and update GitHub Secrets.")
 
-    print("   ✅ Session valid — on LinkedIn feed!")
+    print("   ✅ Session valid — logged in!")
 
 
 # ═══════════════════════════════════════════════════════════════
-# VOYAGER API (LinkedIn's internal REST API)
+# NETWORK RESPONSE INTERCEPTOR
 # ═══════════════════════════════════════════════════════════════
 
-VOYAGER_JS = """
-async (username) => {
-    // Extract CSRF token from JSESSIONID cookie
-    const getCsrf = () => {
-        const m = document.cookie.match(/JSESSIONID=([^;]+)/);
-        if (!m) return '';
-        return m[1].replace(/^"/, '').replace(/"$/, '');
-    };
+class NetworkPostTracker:
+    def __init__(self, username: str):
+        self.username = username
+        self.captured_posts = []
 
-    const csrf = getCsrf();
-    const headers = {
-        'accept': 'application/vnd.linkedin.normalized+json+2.1',
-        'csrf-token': csrf,
-        'x-li-lang': 'en_US',
-        'x-li-page-instance': 'urn:li:page:d_flagship3_profile_view_base;',
-        'x-restli-protocol-version': '2.0.0',
-        'x-li-track': '{"clientVersion":"1.13.10516","mpVersion":"1.13.10516","osName":"web","timezoneOffset":0,"timezone":"America/New_York","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
-    };
+    def handle_response(self, response):
+        url = response.url
+        if not ("voyager/api" in url or "graphql" in url or "feed/updates" in url or "identity/profiles" in url):
+            return
 
-    const log = [];
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        if response.status != 200:
+            return
 
-    // Fetch with automatic retry on 429
-    const fetchWithRetry = async (url, opts, maxRetries = 3) => {
-        for (let i = 0; i < maxRetries; i++) {
-            const resp = await fetch(url, opts);
-            log.push(`  Attempt ${i+1}: ${url.split('?')[0]} → ${resp.status}`);
-            if (resp.status === 429) {
-                const wait = (i + 1) * 20000;  // 20s, 40s, 60s
-                log.push(`  Rate-limited (429). Waiting ${wait/1000}s before retry…`);
-                await sleep(wait);
-                continue;
-            }
-            return resp;
-        }
-        return null;
-    };
-
-    try {
-        // ── Step 1: Resolve vanity name → entity URN ─────────────────────
-        log.push('Fetching profile URN…');
-        const profResp = await fetchWithRetry(
-            `/voyager/api/identity/profiles/${username}?projection=(id,entityUrn)`,
-            { headers, credentials: 'include' }
-        );
-
-        if (!profResp || !profResp.ok) {
-            const status = profResp ? profResp.status : 'null';
-            const body   = profResp ? await profResp.text() : '';
-            return { error: 'profile_fetch_failed', status, log, body: body.substring(0, 500) };
-        }
-
-        const profData = await profResp.json();
-        const entityUrn = (profData.data && profData.data.entityUrn)
-            || profData.entityUrn
-            || '';
-        log.push(`Entity URN: ${entityUrn}`);
-
-        if (!entityUrn) {
-            return { error: 'no_entity_urn', log, sampleData: JSON.stringify(profData).substring(0, 1000) };
-        }
-
-        // ── Step 2: Fetch recent posts ────────────────────────────────────
-        await sleep(5000);  // 5s gap between calls to avoid rate limiting
-
-        log.push('Fetching posts…');
-        const encodedUrn = encodeURIComponent(entityUrn);
-
-        // Primary endpoint
-        let postsResp = await fetchWithRetry(
-            `/voyager/api/feed/updates?profileId=${encodedUrn}&count=15&moduleKey=memberFeedModule&includeLongTermHistory=true`,
-            { headers, credentials: 'include' }
-        );
-
-        // Fallback endpoint if primary fails
-        if (!postsResp || !postsResp.ok) {
-            log.push('Primary posts endpoint failed — trying fallback…');
-            await sleep(10000);
-            postsResp = await fetchWithRetry(
-                `/voyager/api/feed/updates?profileId=${encodedUrn}&count=10`,
-                { headers, credentials: 'include' }
-            );
-        }
-
-        if (!postsResp || !postsResp.ok) {
-            const status = postsResp ? postsResp.status : 'null';
-            return { error: 'posts_fetch_failed', status, log };
-        }
-
-        const postsData = await postsResp.json();
-        log.push(`Included items: ${(postsData.included || []).length}`);
-
-        return { success: true, entityUrn, log, data: postsData };
-
-    } catch(e) {
-        return { error: e.toString(), log };
-    }
-}
-"""
-
-
-def call_voyager_api(page, username):
-    """
-    Call LinkedIn's Voyager API from within the authenticated feed page.
-    Retries are done at the Python level so the page context is kept alive
-    between attempts (JS-level sleeps can destroy the execution context).
-    """
-    # Single-attempt JS — no sleep/retry inside JS to prevent context destruction
-    VOYAGER_SINGLE_JS = """
-async (username) => {
-    const getCsrf = () => {
-        const m = document.cookie.match(/JSESSIONID=([^;]+)/);
-        if (!m) return '';
-        return m[1].replace(/^"/, '').replace(/"$/, '');
-    };
-    const csrf = getCsrf();
-    const headers = {
-        'accept': 'application/vnd.linkedin.normalized+json+2.1',
-        'csrf-token': csrf,
-        'x-li-lang': 'en_US',
-        'x-li-page-instance': 'urn:li:page:d_flagship3_profile_view_base;',
-        'x-restli-protocol-version': '2.0.0',
-        'x-li-track': '{"clientVersion":"1.13.10516","mpVersion":"1.13.10516","osName":"web","timezoneOffset":0,"timezone":"America/New_York","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
-    };
-    try {
-        // Step 1: Get profile entity URN
-        const profResp = await fetch(
-            `/voyager/api/identity/profiles/${username}?projection=(id,entityUrn)`,
-            { headers, credentials: 'include' }
-        );
-        if (!profResp.ok) {
-            const body = await profResp.text();
-            return { status: profResp.status, error: 'profile_failed', body: body.substring(0, 300) };
-        }
-        const profData = await profResp.json();
-        const entityUrn = (profData.data && profData.data.entityUrn) || profData.entityUrn || '';
-        if (!entityUrn) {
-            return { status: 200, error: 'no_urn', sample: JSON.stringify(profData).substring(0, 500) };
-        }
-
-        // Step 2: Get posts
-        const encodedUrn = encodeURIComponent(entityUrn);
-        const postsResp = await fetch(
-            `/voyager/api/feed/updates?profileId=${encodedUrn}&count=15&moduleKey=memberFeedModule&includeLongTermHistory=true`,
-            { headers, credentials: 'include' }
-        );
-        if (!postsResp.ok) {
-            return { status: postsResp.status, error: 'posts_failed', entityUrn };
-        }
-        const postsData = await postsResp.json();
-        return { status: 200, success: true, entityUrn, data: postsData };
-    } catch(e) {
-        return { status: 0, error: e.toString() };
-    }
-}
-"""
-
-    max_attempts = 4
-    wait_times   = [15, 30, 60, 90]  # seconds between retries
-
-    print(f"   Calling Voyager API for: {username}")
-
-    for attempt in range(max_attempts):
-        wait = wait_times[attempt]
-        print(f"   Waiting {wait}s before attempt {attempt + 1} …")
-        time.sleep(wait)
-
-        # Keep page alive with a scroll between retries
         try:
-            page.evaluate("window.scrollBy(0, 100)")
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                return
+
+            data = response.json()
+            extracted = self._parse_json_payload(data)
+            for p in extracted:
+                if not any(existing["text"] == p["text"] for existing in self.captured_posts):
+                    self.captured_posts.append(p)
+                    print(f"   📡 [Network Interceptor] Captured post ({len(p['text'])} chars): {p['text'][:60]}...")
         except Exception:
             pass
 
-        try:
-            result = page.evaluate(VOYAGER_SINGLE_JS, username)
-        except Exception as e:
-            print(f"   ⚠️  page.evaluate error on attempt {attempt + 1}: {e}")
-            continue
+    def _parse_json_payload(self, data) -> list[dict]:
+        posts = []
+        if not isinstance(data, dict):
+            return posts
 
-        status = result.get("status", 0)
-        print(f"   Attempt {attempt + 1}: status={status}")
+        included = data.get("included", [])
+        if isinstance(included, list):
+            for item in included:
+                if not isinstance(item, dict):
+                    continue
+                text = ""
+                # Check commentary or description
+                commentary = item.get("commentary", {})
+                if isinstance(commentary, dict):
+                    t_obj = commentary.get("text", {})
+                    if isinstance(t_obj, dict):
+                        text = t_obj.get("text", "")
+                    elif isinstance(t_obj, str):
+                        text = t_obj
 
-        if result.get("success"):
-            return result
+                if not text:
+                    desc = item.get("description", {})
+                    if isinstance(desc, dict):
+                        text = desc.get("text", "")
 
-        if status == 429:
-            print(f"   Rate-limited (429) — will retry after longer wait")
-            continue
+                if not text and isinstance(item.get("text"), str) and len(item["text"]) > 25:
+                    text = item["text"]
 
-        if result.get("error") == "no_urn":
-            print(f"   Got profile but no URN. Sample: {result.get('sample', '')[:300]}")
-            break  # Retrying won't help
+                if text and len(text.strip()) > 20:
+                    date = ""
+                    for k in ("publishedAt", "createdAt", "postedAt"):
+                        if k in item and isinstance(item[k], (int, float)):
+                            date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(item[k] / 1000))
+                            break
 
-        if result.get("error"):
-            print(f"   Error: {result['error']}")
-            if "body" in result:
-                print(f"   Body: {result['body']}")
-            if status not in (429, 0):
-                break  # Non-retriable error
+                    image_url = ""
+                    content = item.get("content", {})
+                    if isinstance(content, dict):
+                        image_url = content.get("url", "") or content.get("rootUrl", "")
 
-    print("   ❌ All Voyager API attempts exhausted")
-    return {}
+                    posts.append({
+                        "text":      text.strip(),
+                        "date":      date,
+                        "image_url": image_url,
+                        "post_url":  f"https://www.linkedin.com/in/{self.username}/recent-activity/all/",
+                    })
 
-
-
-
-def parse_voyager_posts(api_result, username):
-    """Parse posts from Voyager API response."""
-    posts = []
-
-    if not api_result or not isinstance(api_result, dict):
         return posts
 
-    data = api_result.get("data", {})
-    included = api_result.get("included", [])
 
-    # The normalized JSON format puts all data in 'included'
-    # Each item has a '$type' field indicating what it is
-    for item in included:
-        if not isinstance(item, dict):
-            continue
+# ═══════════════════════════════════════════════════════════════
+# NATURAL SEARCH & UI NAVIGATION
+# ═══════════════════════════════════════════════════════════════
 
-        item_type = item.get("$type", "")
+def navigate_via_search_or_click(page, username: str) -> None:
+    """
+    Navigate to client's profile naturally through UI interaction:
+    1. Try search bar typing on LinkedIn header
+    2. Fallback to direct client-side search results page
+    3. Click profile link to load profile & activity feed
+    This avoids server-side navigation blocks & SPA redirect loops.
+    """
+    print(f"   Navigating to profile for: {username} ...")
 
-        # Look for feed update items with text content
-        text = ""
+    # Strategy 1: Use LinkedIn search bar if available
+    try:
+        search_box = page.locator("input.search-global-typeahead__input, input[placeholder*='Search']").first
+        if search_box.is_visible(timeout=5_000):
+            print("   🔍 Typing username into LinkedIn search bar ...")
+            search_box.click()
+            search_box.fill(username)
+            human_delay(1, 2)
+            search_box.press("Enter")
+            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            human_delay(3, 5)
+            save_debug_screenshot(page, "02_search_results")
+    except Exception as e:
+        print(f"   ⚠️ Search bar interaction notice: {e}")
 
-        # Pattern 1: commentary object
-        commentary = item.get("commentary", {})
-        if isinstance(commentary, dict):
-            text_obj = commentary.get("text", {})
-            if isinstance(text_obj, dict):
-                text = text_obj.get("text", "")
-            elif isinstance(text_obj, str):
-                text = text_obj
+    # Strategy 2: Direct Search URL (bypasses profile redirect guard)
+    if username not in page.url:
+        search_url = f"https://www.linkedin.com/search/results/all/?keywords={username}"
+        print(f"   Loading search URL: {search_url}")
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            human_delay(3, 5)
+            save_debug_screenshot(page, "02_search_page")
+        except Exception as e:
+            print(f"   ⚠️ Search URL load notice: {e}")
 
-        # Pattern 2: description object (older format)
-        if not text:
-            desc = item.get("description", {})
-            if isinstance(desc, dict):
-                text = desc.get("text", "")
-
-        # Pattern 3: direct text field
-        if not text:
-            text_field = item.get("text", {})
-            if isinstance(text_field, dict):
-                text = text_field.get("text", "")
-            elif isinstance(text_field, str) and len(text_field) > 30:
-                text = text_field
-
-        if not text or len(text.strip()) < 20:
-            continue
-
-        # Get date
-        date = ""
-        for key in ("publishedAt", "createdAt", "postedAt", "updatedAt"):
-            if key in item:
-                ts = item[key]
-                if isinstance(ts, (int, float)) and ts > 0:
-                    date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts / 1000))
-                elif isinstance(ts, str):
-                    date = ts
+    # Strategy 3: Click profile result link
+    profile_clicked = False
+    selectors = [
+        f"a[href*='/in/{username}']",
+        "a.app-aware-link[href*='/in/']",
+        ".entity-result__title-text a",
+        ".reusable-search__result-container a",
+    ]
+    for sel in selectors:
+        try:
+            link = page.locator(sel).first
+            if link.is_visible(timeout=4_000):
+                href = link.get_attribute("href") or ""
+                print(f"   ✅ Found profile link ({sel}) → {href}")
+                link.click()
+                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                human_delay(4, 6)
+                save_debug_screenshot(page, "02b_profile_page")
+                profile_clicked = True
                 break
+        except Exception:
+            continue
 
-        # Get image
-        image_url = ""
-        images = item.get("content", {})
-        if isinstance(images, dict):
-            root_url = images.get("url", "") or images.get("rootUrl", "")
-            if root_url:
-                image_url = root_url
+    if not profile_clicked:
+        print("   ⚠️ Could not click profile link from search — attempting direct profile SPA load")
+        try:
+            page.evaluate(f"window.location.href = 'https://www.linkedin.com/in/{username}/'")
+            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            human_delay(4, 6)
+            save_debug_screenshot(page, "02b_profile_spa")
+        except Exception as e:
+            print(f"   ⚠️ Profile load notice: {e}")
 
-        # Get post URL
-        post_url = LINKEDIN_PROFILE_URL
-        actor_urn = item.get("actor", "") or item.get("socialDetail", {})
-        if isinstance(actor_urn, dict):
-            actor_urn = actor_urn.get("urn", "")
+    # Scroll down to trigger Activity section & network calls
+    print("   Scrolling page to trigger Activity feed network calls ...")
+    for i in range(6):
+        page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
+        human_delay(1.5, 3.0)
 
-        posts.append({
-            "text":      text.strip(),
-            "date":      date,
-            "image_url": image_url,
-            "post_url":  post_url,
-        })
+    # Click 'Show all posts' / 'See all activity' if visible
+    activity_links = [
+        "a[href*='recent-activity']:has-text('Show all')",
+        "a[href*='recent-activity']:has-text('See all')",
+        "a[href*='recent-activity/all']",
+        ".pv-recent-activity-section a",
+        "button:has-text('Show all posts')",
+    ]
+    for sel in activity_links:
+        try:
+            act_link = page.locator(sel).first
+            if act_link.is_visible(timeout=3_000):
+                print(f"   ✅ Clicking activity link: {sel}")
+                act_link.click()
+                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                human_delay(3, 5)
+                # Scroll activity page
+                for _ in range(5):
+                    page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
+                    human_delay(1.5, 2.5)
+                save_debug_screenshot(page, "03_activity_page")
+                break
+        except Exception:
+            continue
 
-        if len(posts) == 6:
-            break
+
+# ═══════════════════════════════════════════════════════════════
+# DOM EXTRACTION FALLBACK
+# ═══════════════════════════════════════════════════════════════
+
+def extract_posts_from_dom(page, username: str) -> list[dict]:
+    posts = []
+    selectors = [
+        ".feed-shared-update-v2",
+        ".occludable-update",
+        "[data-urn*='activity']",
+        ".profile-creator-shared-feed-update__container",
+        ".pvs-list__item--line-separated",
+        ".artdeco-list__item",
+        "li.artdeco-list__item",
+    ]
+
+    post_elements = []
+    for sel in selectors:
+        try:
+            elements = page.query_selector_all(sel)
+            if elements:
+                print(f"   Found {len(elements)} DOM elements via: {sel}")
+                post_elements = elements
+                break
+        except Exception:
+            pass
+
+    for el in post_elements[:14]:
+        try:
+            text_el = (
+                el.query_selector(".feed-shared-update-v2__description")
+                or el.query_selector(".feed-shared-text")
+                or el.query_selector(".break-words")
+                or el.query_selector(".update-components-text")
+            )
+            raw_text = text_el.inner_text().strip() if text_el else ""
+            if not raw_text or len(raw_text) < 15:
+                continue
+
+            time_el = el.query_selector("time")
+            image_el = (
+                el.query_selector(".feed-shared-image__image")
+                or el.query_selector(".update-components-image__image")
+                or el.query_selector("img.ivm-view-attr__img--centered")
+            )
+            link_el = (
+                el.query_selector("a[href*='/feed/update/']")
+                or el.query_selector("a.app-aware-link[href*='activity']")
+            )
+
+            posts.append({
+                "text":      raw_text,
+                "date":      time_el.get_attribute("datetime") if time_el else "",
+                "image_url": image_el.get_attribute("src") if image_el else "",
+                "post_url":  link_el.get_attribute("href") if link_el else f"https://www.linkedin.com/in/{username}/recent-activity/all/",
+            })
+            if len(posts) == 6:
+                break
+        except Exception:
+            continue
 
     return posts
 
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN
+# MAIN SCRAPE EXECUTION
 # ═══════════════════════════════════════════════════════════════
 
-def scrape():
+def scrape() -> None:
     if not LI_AT_COOKIE:
-        raise ValueError("LINKEDIN_LI_AT secret not set.")
+        raise ValueError("LINKEDIN_LI_AT secret is not set.")
     if not LINKEDIN_PROFILE_URL:
-        raise ValueError("LINKEDIN_PROFILE_URL secret not set.")
+        raise ValueError("LINKEDIN_PROFILE_URL secret is not set.")
 
     username = extract_username_from_url(LINKEDIN_PROFILE_URL)
     if not username:
         raise ValueError(f"Cannot extract username from: {LINKEDIN_PROFILE_URL}")
 
-    print("🚀 Starting LinkedIn scraper (Voyager API) …")
-    print(f"   Client username: {username}")
+    print("🚀 Starting LinkedIn scraper (Custom Playwright + Interceptor) …")
+    print(f"   Target Username: {username}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage", "--window-size=1366,768",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--disable-dev-shm-usage",
+                "--window-size=1366,768",
             ],
         )
+
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1366, "height": 768},
-            locale="en-US", timezone_id="America/New_York",
+            locale="en-US",
+            timezone_id="America/New_York",
+            java_script_enabled=True,
         )
         context.set_default_timeout(DEFAULT_TIMEOUT)
-        inject_session_cookie(context)
 
+        inject_session_cookie(context)
         page = context.new_page()
         stealth_sync(page)
-        # Give the Voyager API JS up to 5 minutes (retries can take 60s+ each)
-        page.set_default_timeout(300_000)
+
+        # Attach network response listener to capture API JSON payloads
+        tracker = NetworkPostTracker(username)
+        page.on("response", tracker.handle_response)
 
         posts = []
         try:
-            # 1. Load feed (establishes authenticated context with JSESSIONID)
-            load_linkedin_feed(page)
+            # Step 1: Login check & session warmup
+            verify_and_warmup_session(page)
 
-            # 2. Call Voyager API from within the LinkedIn page context
-            print("\n── Voyager API ─────────────────────────────────────────────")
-            api_result = call_voyager_api(page, username)
+            # Step 2: Search & UI Navigation
+            navigate_via_search_or_click(page, username)
 
-            # Log diagnostic info
-            print(f"   API call log:")
-            for line in api_result.get("log", []):
-                print(f"     {line}")
+            # Step 3: Check captured posts from network response interceptor
+            print(f"\n   Checking Network Interceptor results: {len(tracker.captured_posts)} posts captured")
+            if tracker.captured_posts:
+                posts = tracker.captured_posts[:6]
 
-            if api_result.get("error"):
-                print(f"   ❌ API error: {api_result['error']}")
-                if "sampleData" in api_result:
-                    print(f"   Sample data: {api_result['sampleData'][:500]}")
-                if "body" in api_result:
-                    print(f"   Response body: {api_result['body']}")
-            elif api_result.get("success"):
-                entity_urn = api_result.get("entityUrn", "")
-                print(f"   ✅ API succeeded! Entity URN: {entity_urn}")
+            # Step 4: DOM extraction fallback if needed
+            if not posts:
+                print("   Running DOM extraction fallback ...")
+                posts = extract_posts_from_dom(page, username)
 
-                # Save raw API response for reference
-                raw_data = api_result.get("data", {})
-                with open("voyager_response.json", "w", encoding="utf-8") as f:
-                    json.dump(raw_data, f, ensure_ascii=False, indent=2)
-                print("   📄 Saved voyager_response.json")
-
-                # Parse posts from response
-                posts = parse_voyager_posts(raw_data, username)
-                print(f"   Extracted {len(posts)} posts")
-
-                if not posts:
-                    # Try parsing from the full result (included may be top-level)
-                    posts = parse_voyager_posts(api_result, username)
-                    print(f"   Re-tried from full result: {len(posts)} posts")
-
-            # 3. Auto-refresh cookie
-            fresh = extract_fresh_li_at(context)
-            if fresh and fresh != LI_AT_COOKIE:
-                print("   🔄 Cookie refreshed by LinkedIn — saving …")
-                refresh_github_secret("LINKEDIN_LI_AT", fresh)
-            elif fresh:
-                print("   ✅ Cookie unchanged — still fresh")
-
-            save_debug_screenshot(page, "02_final_state")
+            # Step 5: Check and auto-refresh cookie secret
+            fresh_cookie = extract_fresh_li_at(context)
+            if fresh_cookie and fresh_cookie != LI_AT_COOKIE:
+                print("   🔄 Cookie refreshed by LinkedIn — saving to GitHub secret ...")
+                refresh_github_secret("LINKEDIN_LI_AT", fresh_cookie)
+            elif fresh_cookie:
+                print("   ✅ Session cookie verified")
 
         except Exception as e:
-            try:
-                save_debug_screenshot(page, "error_state")
-            except Exception:
-                pass
+            save_debug_screenshot(page, "error_state")
             browser.close()
             raise e
 
@@ -528,18 +466,14 @@ def scrape():
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "post_count": len(posts),
-        "posts": posts,
+        "posts":      posts,
     }
     with open("posts.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"\n✅ Done! Scraped {len(posts)} posts → posts.json")
     if len(posts) == 0:
-        print(
-            "\n⚠️  0 posts. Key debug files in artifacts:\n"
-            "  • voyager_response.json — raw API response (if API was reached)\n"
-            "  • *.png screenshots\n"
-        )
+        print("⚠️ 0 posts scraped — check debug screenshots in workflow artifacts.")
 
 
 if __name__ == "__main__":
