@@ -1,14 +1,11 @@
 import json
 import time
-import random
+import re
+import html
 import os
 import base64
-import re
 import requests
 from nacl import encoding, public as nacl_public
-
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from playwright_stealth import stealth_sync
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 LI_AT_COOKIE         = os.environ.get("LINKEDIN_LI_AT", "")
@@ -16,32 +13,6 @@ LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
 GH_PAT               = os.environ.get("GH_PAT", "")
 GITHUB_REPOSITORY    = os.environ.get("GITHUB_REPOSITORY", "")
 # ──────────────────────────────────────────────────────────────────────────────
-
-DEFAULT_TIMEOUT = 60_000  # ms
-
-
-# ═══════════════════════════════════════════════════════════════
-# UTILITIES
-# ═══════════════════════════════════════════════════════════════
-
-def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
-    time.sleep(random.uniform(min_s, max_s))
-
-
-def save_debug_screenshot(page, name: str) -> None:
-    try:
-        page.screenshot(path=f"{name}.png", full_page=True)
-        print(f"   📸 {name}.png")
-    except Exception as e:
-        print(f"   ⚠️  Screenshot failed: {e}")
-
-
-def print_page_info(page, label: str = "") -> None:
-    try:
-        print(f"   [{label}] URL:   {page.url}")
-        print(f"   [{label}] Title: {page.title()}")
-    except Exception:
-        pass
 
 
 def extract_username_from_url(url: str) -> str:
@@ -84,268 +55,202 @@ def refresh_github_secret(secret_name: str, new_value: str) -> bool:
     return False
 
 
-def extract_fresh_li_at(context) -> str:
-    for c in context.cookies():
-        if c["name"] == "li_at" and "linkedin.com" in c.get("domain", ""):
-            return c["value"]
+# ═══════════════════════════════════════════════════════════════
+# PAYLOAD PARSER (HTML <code> EMBEDDED JSON)
+# ═══════════════════════════════════════════════════════════════
+
+def _extract_text_from_item(item: dict) -> str:
+    # 1. Commentary
+    commentary = item.get("commentary")
+    if isinstance(commentary, dict):
+        text_obj = commentary.get("text")
+        if isinstance(text_obj, dict):
+            t = text_obj.get("text")
+            if isinstance(t, str):
+                return t.strip()
+        elif isinstance(text_obj, str):
+            return text_obj.strip()
+
+    # 2. Description
+    desc = item.get("description")
+    if isinstance(desc, dict):
+        t = desc.get("text")
+        if isinstance(t, str):
+            return t.strip()
+    elif isinstance(desc, str):
+        return desc.strip()
+
+    # 3. Direct text field
+    text_val = item.get("text")
+    if isinstance(text_val, dict):
+        t = text_val.get("text")
+        if isinstance(t, str):
+            return t.strip()
+    elif isinstance(text_val, str):
+        return text_val.strip()
+
     return ""
 
 
-# ═══════════════════════════════════════════════════════════════
-# SESSION SETUP
-# ═══════════════════════════════════════════════════════════════
-
-def inject_session_cookie(context) -> None:
-    context.add_cookies([{
-        "name":     "li_at",
-        "value":    LI_AT_COOKIE,
-        "domain":   ".linkedin.com",
-        "path":     "/",
-        "httpOnly": True,
-        "secure":   True,
-        "sameSite": "None",
-    }])
-    print("   ✅ Session cookie injected")
+def _extract_date_from_item(item: dict) -> str:
+    for k in ("publishedAt", "createdAt", "postedAt", "created", "timestamp"):
+        val = item.get(k)
+        if isinstance(val, (int, float)) and val > 1_000_000_000:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(val / 1000))
+        elif isinstance(val, str) and len(val) > 5:
+            return val
+    return ""
 
 
-def verify_and_warmup_session(page) -> None:
-    print("   Verifying session on feed page …")
-    try:
-        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-    except Exception as e:
-        if "ERR_TOO_MANY_REDIRECTS" in str(e):
-            raise RuntimeError("❌ Cookie is INVALID or REVOKED. Update LINKEDIN_LI_AT in GitHub Secrets.") from None
-        raise
-
-    human_delay(3, 5)
-    print_page_info(page, "feed-check")
-    save_debug_screenshot(page, "01_feed_check")
-
-    url = page.url
-    if "login" in url or "authwall" in url or "signup" in url:
-        raise RuntimeError("❌ Cookie has EXPIRED. Get a fresh li_at cookie and update GitHub Secrets.")
-
-    print("   ✅ Session valid — logged in!")
+def _extract_image_from_item(item: dict) -> str:
+    content = item.get("content")
+    if isinstance(content, dict):
+        url = content.get("url") or content.get("rootUrl")
+        if url:
+            return str(url)
+        images = content.get("images")
+        if isinstance(images, list) and len(images) > 0:
+            img = images[0]
+            if isinstance(img, dict):
+                return img.get("url") or img.get("rootUrl", "")
+    return ""
 
 
-# ═══════════════════════════════════════════════════════════════
-# NETWORK RESPONSE INTERCEPTOR
-# ═══════════════════════════════════════════════════════════════
+def _extract_post_url_from_item(item: dict, username: str) -> str:
+    entity_urn = item.get("entityUrn") or item.get("urn") or ""
+    if "activity:" in entity_urn or "share:" in entity_urn:
+        act_id = entity_urn.split(":")[-1]
+        return f"https://www.linkedin.com/feed/update/urn:li:activity:{act_id}/"
+    return f"https://www.linkedin.com/in/{username}/recent-activity/all/"
 
-class NetworkPostTracker:
-    def __init__(self, username: str):
-        self.username = username
-        self.captured_posts = []
 
-    def handle_response(self, response):
-        url = response.url
-        if not ("voyager/api" in url or "graphql" in url or "feed/updates" in url or "identity/profiles" in url or "dash/channels" in url):
-            return
+def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
+    posts = []
+    seen_texts = set()
 
-        if response.status != 200:
-            return
+    # Find all <code>...</code> blocks in the HTML
+    code_blocks = re.findall(r'<code[^>]*>(.*?)</code>', html_content, re.DOTALL)
+    print(f"   Found {len(code_blocks)} <code> tags in response HTML")
+
+    for raw_block in code_blocks:
+        cleaned = raw_block.strip()
+
+        # Remove HTML comment wrappers if present <!-- ... -->
+        if cleaned.startswith("<!--") and cleaned.endswith("-->"):
+            cleaned = cleaned[4:-3].strip()
+
+        # Unescape HTML entities like &quot;, &amp;
+        cleaned = html.unescape(cleaned)
+
+        if not (cleaned.startswith("{") or cleaned.startswith("[")):
+            continue
 
         try:
-            content_type = response.headers.get("content-type", "")
-            if "json" not in content_type:
-                return
-
-            data = response.json()
-            extracted = self._parse_json_payload(data)
-            for p in extracted:
-                if not any(existing["text"] == p["text"] for existing in self.captured_posts):
-                    self.captured_posts.append(p)
-                    print(f"   📡 [Network Interceptor] Captured post ({len(p['text'])} chars): {p['text'][:60]}...")
-        except Exception:
-            pass
-
-    def _parse_json_payload(self, data) -> list[dict]:
-        posts = []
-        if not isinstance(data, dict):
-            return posts
-
-        included = data.get("included", [])
-        if isinstance(included, list):
-            for item in included:
-                if not isinstance(item, dict):
-                    continue
-                text = ""
-                # Check commentary or description
-                commentary = item.get("commentary", {})
-                if isinstance(commentary, dict):
-                    t_obj = commentary.get("text", {})
-                    if isinstance(t_obj, dict):
-                        text = t_obj.get("text", "")
-                    elif isinstance(t_obj, str):
-                        text = t_obj
-
-                if not text:
-                    desc = item.get("description", {})
-                    if isinstance(desc, dict):
-                        text = desc.get("text", "")
-
-                if not text and isinstance(item.get("text"), str) and len(item["text"]) > 25:
-                    text = item["text"]
-
-                if text and len(text.strip()) > 20:
-                    date = ""
-                    for k in ("publishedAt", "createdAt", "postedAt"):
-                        if k in item and isinstance(item[k], (int, float)):
-                            date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(item[k] / 1000))
-                            break
-
-                    image_url = ""
-                    content = item.get("content", {})
-                    if isinstance(content, dict):
-                        image_url = content.get("url", "") or content.get("rootUrl", "")
-
-                    posts.append({
-                        "text":      text.strip(),
-                        "date":      date,
-                        "image_url": image_url,
-                        "post_url":  f"https://www.linkedin.com/in/{self.username}/recent-activity/all/",
-                    })
-
-        return posts
-
-
-# ═══════════════════════════════════════════════════════════════
-# ROBUST UI & SOFT NAVIGATION TO PROFILE / ACTIVITY
-# ═══════════════════════════════════════════════════════════════
-
-def navigate_to_user_activity(page, username: str) -> None:
-    """
-    1. Load base profile first: https://www.linkedin.com/in/{username}/
-    2. Soft-click or soft-navigate to activity page to avoid ERR_ABORTED
-    """
-    base_profile_url = f"https://www.linkedin.com/in/{username}/"
-    activity_url = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
-
-    print(f"   Step 1: Loading base profile: {base_profile_url}")
-    try:
-        page.goto(base_profile_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-        human_delay(3, 5)
-        print_page_info(page, "base-profile")
-        save_debug_screenshot(page, "02a_base_profile")
-    except Exception as e:
-        print(f"   ⚠️ Base profile load notice: {e}")
-
-    # Scroll profile to load Activity section
-    print("   Scrolling base profile ...")
-    for _ in range(4):
-        page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
-        human_delay(1.5, 2.5)
-
-    save_debug_screenshot(page, "02b_profile_scrolled")
-
-    # Step 2: Try clicking 'Show all posts' button on profile page
-    show_all_selectors = [
-        "a[href*='recent-activity']:has-text('Show all')",
-        "a[href*='recent-activity']:has-text('See all')",
-        "a[href*='recent-activity/all']",
-        "a[href*='recent-activity']",
-        ".pv-recent-activity-section a",
-        "button:has-text('Show all posts')",
-        "span:has-text('Show all posts')",
-    ]
-
-    clicked = False
-    for sel in show_all_selectors:
-        try:
-            link = page.locator(sel).first
-            if link.is_visible(timeout=3_000):
-                print(f"   ✅ Found & clicking Activity link: {sel}")
-                link.click()
-                human_delay(4, 6)
-                save_debug_screenshot(page, "02c_after_link_click")
-                clicked = True
-                break
+            data = json.loads(cleaned)
         except Exception:
             continue
 
-    if not clicked:
-        print("   Step 3: Triggering soft JS location change to activity feed ...")
-        try:
-            page.evaluate(f"window.location.href = '{activity_url}'")
-            human_delay(4, 6)
-            save_debug_screenshot(page, "02c_soft_js_nav")
-        except Exception as e:
-            print(f"   ⚠️ Soft JS nav notice: {e}")
+        # Extract items from JSON structure
+        items = []
+        if isinstance(data, dict):
+            if "included" in data and isinstance(data["included"], list):
+                items.extend(data["included"])
+            if "data" in data and isinstance(data["data"], dict):
+                items.append(data["data"])
+        elif isinstance(data, list):
+            items.extend(data)
 
-    # Scroll Activity page to trigger lazy loading of post cards
-    print("   Scrolling activity feed ...")
-    for _ in range(6):
-        page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
-        human_delay(2.0, 3.0)
-
-    save_debug_screenshot(page, "03_after_scroll")
-
-
-# ═══════════════════════════════════════════════════════════════
-# DOM EXTRACTION FALLBACK
-# ═══════════════════════════════════════════════════════════════
-
-def extract_posts_from_dom(page, username: str) -> list[dict]:
-    posts = []
-    selectors = [
-        ".feed-shared-update-v2",
-        ".occludable-update",
-        "[data-urn*='activity']",
-        ".profile-creator-shared-feed-update__container",
-        ".pvs-list__item--line-separated",
-        ".artdeco-list__item",
-        "li.artdeco-list__item",
-        ".update-components-text",
-        ".pv-recent-activity-detail-v2",
-        ".pvs-entity",
-    ]
-
-    post_elements = []
-    for sel in selectors:
-        try:
-            elements = page.query_selector_all(sel)
-            if elements:
-                print(f"   Found {len(elements)} DOM elements via selector: {sel}")
-                post_elements = elements
-                break
-        except Exception:
-            pass
-
-    for el in post_elements[:14]:
-        try:
-            text_el = (
-                el.query_selector(".feed-shared-update-v2__description")
-                or el.query_selector(".feed-shared-text")
-                or el.query_selector(".break-words")
-                or el.query_selector(".update-components-text")
-                or el.query_selector("[data-test-id='main-feed-activity-card__commentary']")
-                or el.query_selector("span[dir='ltr']")
-            )
-            raw_text = text_el.inner_text().strip() if text_el else ""
-            if not raw_text or len(raw_text) < 15:
+        for item in items:
+            if not isinstance(item, dict):
                 continue
 
-            time_el = el.query_selector("time")
-            image_el = (
-                el.query_selector(".feed-shared-image__image")
-                or el.query_selector(".update-components-image__image")
-                or el.query_selector("img.ivm-view-attr__img--centered")
-            )
-            link_el = (
-                el.query_selector("a[href*='/feed/update/']")
-                or el.query_selector("a.app-aware-link[href*='activity']")
-            )
+            text = _extract_text_from_item(item)
+            if not text or len(text) < 15 or text in seen_texts:
+                continue
+
+            # Skip header bio / employment summary strings
+            if any(text.startswith(prefix) for prefix in ("Web Developer at", "Experience", "Education", "Contact info")):
+                continue
+
+            seen_texts.add(text)
+
+            date = _extract_date_from_item(item)
+            image_url = _extract_image_from_item(item)
+            post_url = _extract_post_url_from_item(item, username)
 
             posts.append({
-                "text":      raw_text,
-                "date":      time_el.get_attribute("datetime") if time_el else "",
-                "image_url": image_el.get_attribute("src") if image_el else "",
-                "post_url":  link_el.get_attribute("href") if link_el else f"https://www.linkedin.com/in/{username}/recent-activity/all/",
+                "text":      text,
+                "date":      date,
+                "image_url": image_url,
+                "post_url":  post_url,
             })
-            if len(posts) == 6:
+
+            if len(posts) >= 6:
                 break
-        except Exception:
-            continue
+
+        if len(posts) >= 6:
+            break
+
+    return posts
+
+
+# ═══════════════════════════════════════════════════════════════
+# SINGLE DIRECT REQUEST SCRAPER
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_posts_direct(username: str) -> list[dict]:
+    session = requests.Session()
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    if LI_AT_COOKIE:
+        session.cookies.set("li_at", LI_AT_COOKIE, domain=".linkedin.com")
+        print("   ✅ Session cookie set")
+
+    target_urls = [
+        f"https://www.linkedin.com/in/{username}/recent-activity/all/",
+        f"https://www.linkedin.com/in/{username}/",
+    ]
+
+    posts = []
+    for url in target_urls:
+        print(f"   GET {url} ...")
+        try:
+            resp = session.get(url, headers=headers, allow_redirects=True, timeout=30)
+            print(f"   Response status: {resp.status_code} | Final URL: {resp.url}")
+
+            # Check if cookie was updated in response
+            for cookie in session.cookies:
+                if cookie.name == "li_at" and cookie.value and cookie.value != LI_AT_COOKIE:
+                    print("   🔄 Session cookie updated by server — auto-refreshing secret ...")
+                    refresh_github_secret("LINKEDIN_LI_AT", cookie.value)
+                    break
+
+            if resp.status_code == 200:
+                posts = parse_linkedin_html_payload(resp.text, username)
+                if posts:
+                    print(f"   ✅ Successfully extracted {len(posts)} posts from {url}")
+                    break
+        except Exception as e:
+            print(f"   ⚠️ Request notice: {e}")
 
     return posts
 
@@ -355,8 +260,6 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════
 
 def scrape() -> None:
-    if not LI_AT_COOKIE:
-        raise ValueError("LINKEDIN_LI_AT secret is not set.")
     if not LINKEDIN_PROFILE_URL:
         raise ValueError("LINKEDIN_PROFILE_URL secret is not set.")
 
@@ -364,76 +267,10 @@ def scrape() -> None:
     if not username:
         raise ValueError(f"Cannot extract username from: {LINKEDIN_PROFILE_URL}")
 
-    print("🚀 Starting LinkedIn scraper (Robust Navigation + Interceptor) …")
+    print("🚀 Starting LinkedIn scraper (Direct Single Request) …")
     print(f"   Target Username: {username}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-extensions",
-                "--disable-dev-shm-usage",
-                "--window-size=1366,768",
-            ],
-        )
-
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="America/New_York",
-            java_script_enabled=True,
-        )
-        context.set_default_timeout(DEFAULT_TIMEOUT)
-
-        inject_session_cookie(context)
-        page = context.new_page()
-        stealth_sync(page)
-
-        # Attach network response listener to capture API JSON payloads
-        tracker = NetworkPostTracker(username)
-        page.on("response", tracker.handle_response)
-
-        posts = []
-        try:
-            # Step 1: Login check & session warmup
-            verify_and_warmup_session(page)
-
-            # Step 2: Robust Navigation to Profile & Activity tab
-            navigate_to_user_activity(page, username)
-
-            # Step 3: Check captured posts from network response interceptor
-            print(f"\n   Checking Network Interceptor results: {len(tracker.captured_posts)} posts captured")
-            if tracker.captured_posts:
-                posts = tracker.captured_posts[:6]
-
-            # Step 4: DOM extraction fallback if needed
-            if not posts:
-                print("   Running DOM extraction fallback ...")
-                posts = extract_posts_from_dom(page, username)
-
-            # Step 5: Check and auto-refresh cookie secret
-            fresh_cookie = extract_fresh_li_at(context)
-            if fresh_cookie and fresh_cookie != LI_AT_COOKIE:
-                print("   🔄 Cookie refreshed by LinkedIn — saving to GitHub secret ...")
-                refresh_github_secret("LINKEDIN_LI_AT", fresh_cookie)
-            elif fresh_cookie:
-                print("   ✅ Session cookie verified")
-
-        except Exception as e:
-            save_debug_screenshot(page, "error_state")
-            browser.close()
-            raise e
-
-        browser.close()
+    posts = fetch_posts_direct(username)
 
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -444,8 +281,6 @@ def scrape() -> None:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"\n✅ Done! Scraped {len(posts)} posts → posts.json")
-    if len(posts) == 0:
-        print("⚠️ 0 posts scraped — check debug screenshots in workflow artifacts.")
 
 
 if __name__ == "__main__":
