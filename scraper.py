@@ -3,6 +3,7 @@ import time
 import random
 import os
 import base64
+import re
 import requests
 from nacl import encoding, public as nacl_public
 
@@ -14,7 +15,6 @@ LI_AT_COOKIE         = os.environ.get("LINKEDIN_LI_AT", "")
 LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
 
 # For auto-refresh: a GitHub Personal Access Token with repo scope
-# This lets the scraper update the LINKEDIN_LI_AT secret automatically
 GH_PAT            = os.environ.get("GH_PAT", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # auto-set by GitHub Actions
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,6 +140,57 @@ def inject_session_cookie(context) -> None:
         }
     ])
     print("   ✅ Session cookie injected (no login form, no CAPTCHA)")
+
+
+def extract_username_from_url(url: str) -> str:
+    """
+    Extract the LinkedIn username/slug from any LinkedIn profile URL format.
+    Handles:
+      https://www.linkedin.com/in/username/
+      https://www.linkedin.com/in/username/recent-activity/all/
+      https://www.linkedin.com/in/username/recent-activity/shares/
+    """
+    match = re.search(r'linkedin\.com/in/([^/?#]+)', url)
+    if match:
+        return match.group(1).strip('/')
+    return ""
+
+
+def build_activity_url(username: str) -> str:
+    """Build the canonical recent-activity URL for a given LinkedIn username."""
+    return f"https://www.linkedin.com/in/{username}/recent-activity/all/"
+
+
+def navigate_to_profile(page, username: str) -> None:
+    """
+    Navigate to the client's LinkedIn activity page in two steps:
+    1. Go to the base profile page first (avoids redirect loops)
+    2. Then go to the recent-activity page
+    This prevents ERR_TOO_MANY_REDIRECTS caused by stale or malformed activity URLs.
+    """
+    base_url     = f"https://www.linkedin.com/in/{username}/"
+    activity_url = build_activity_url(username)
+
+    # Step 1: base profile
+    print(f"   Step 1 — Loading base profile: {base_url}")
+    try:
+        page.goto(base_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    except Exception as e:
+        print(f"   ⚠️  Base profile load warning (continuing): {e}")
+    human_delay(3, 5)
+    print_page_info(page, "base-profile")
+    save_debug_screenshot(page, "02a_base_profile")
+
+    # Step 2: activity page
+    print(f"   Step 2 — Loading activity page: {activity_url}")
+    try:
+        page.goto(activity_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    except Exception as e:
+        # Catch redirect errors — page may still have loaded partially
+        print(f"   ⚠️  Activity page warning (will try to scrape anyway): {e}")
+    human_delay(4, 6)
+    print_page_info(page, "activity-page")
+    save_debug_screenshot(page, "02b_activity_page")
 
 
 def verify_session(page) -> None:
@@ -292,12 +343,15 @@ def scrape() -> None:
             # ── 2. Verify session ─────────────────────────────────────────────
             verify_session(page)
 
-            # ── 3. Navigate to client profile ─────────────────────────────────
-            print(f"\n   Navigating to: {LINKEDIN_PROFILE_URL}")
-            page.goto(LINKEDIN_PROFILE_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            human_delay(4, 7)
-            print_page_info(page, "profile")
-            save_debug_screenshot(page, "02_profile_page")
+            # ── 3. Navigate to client profile (two-step to avoid redirects) ───
+            username = extract_username_from_url(LINKEDIN_PROFILE_URL)
+            if not username:
+                raise ValueError(
+                    f"Could not extract LinkedIn username from LINKEDIN_PROFILE_URL.\n"
+                    f"Make sure it looks like: https://www.linkedin.com/in/USERNAME/"
+                )
+            print(f"\n   Client LinkedIn username: {username}")
+            navigate_to_profile(page, username)
 
             # ── 4. Scroll to trigger lazy-load ────────────────────────────────
             print("   Scrolling to load posts …")
