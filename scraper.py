@@ -3,95 +3,250 @@ import time
 import random
 import os
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_sync
 
-# ─── CREDENTIALS (injected from GitHub Secrets or .env) ───────────────────────
-LINKEDIN_EMAIL    = os.environ.get("LINKEDIN_EMAIL", "")
-LINKEDIN_PASSWORD = os.environ.get("LINKEDIN_PASSWORD", "")
-# Client's LinkedIn "recent activity / shares" page URL
-# Format: https://www.linkedin.com/in/CLIENT-USERNAME/recent-activity/all/
+# ─── CREDENTIALS ───────────────────────────────────────────────────────────────
+LINKEDIN_EMAIL       = os.environ.get("LINKEDIN_EMAIL", "")
+LINKEDIN_PASSWORD    = os.environ.get("LINKEDIN_PASSWORD", "")
 LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Increase all default timeouts to 60 seconds
+DEFAULT_TIMEOUT = 60_000   # ms
+
 
 def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
-    """Sleep for a random duration to mimic human behaviour."""
     time.sleep(random.uniform(min_s, max_s))
 
 
-def scroll_slowly(page, steps: int = 4) -> None:
-    """Gradually scroll down the page like a human reading content."""
+def scroll_slowly(page, steps: int = 5) -> None:
     for _ in range(steps):
-        page.evaluate("window.scrollBy(0, window.innerHeight * 0.7)")
+        page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
         human_delay(1.5, 3.0)
 
 
+def save_debug_screenshot(page, name: str = "debug") -> None:
+    """Save a screenshot so you can see what the browser is looking at."""
+    try:
+        path = f"{name}.png"
+        page.screenshot(path=path, full_page=False)
+        print(f"   📸 Screenshot saved: {path}")
+    except Exception as e:
+        print(f"   ⚠️  Could not save screenshot: {e}")
+
+
+def dismiss_cookie_banner(page) -> None:
+    """Dismiss any cookie consent overlay LinkedIn may show."""
+    cookie_selectors = [
+        "button[action-type='ACCEPT']",
+        "button.artdeco-global-alert__action",
+        "[data-tracking-control-name='cookie-consent-accept']",
+        "button:has-text('Accept')",
+        "button:has-text('Allow')",
+        "button:has-text('Agree')",
+    ]
+    for sel in cookie_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=3_000):
+                btn.click()
+                human_delay(1, 2)
+                print("   ✅ Dismissed cookie/consent banner")
+                return
+        except Exception:
+            continue
+
+
+def do_login(page) -> None:
+    """Navigate to LinkedIn login and fill credentials."""
+
+    # ── 1. Go to login page ────────────────────────────────────────────────────
+    print("   Opening LinkedIn login page …")
+    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+
+    # Give JS time to settle
+    human_delay(3, 5)
+
+    # Dismiss any cookie banner that blocks the form
+    dismiss_cookie_banner(page)
+    human_delay(1, 2)
+
+    # ── 2. Wait for the email field with multiple fallback selectors ───────────
+    print("   Waiting for login form …")
+    username_selectors = [
+        "#username",
+        "input[name='session_key']",
+        "input[autocomplete='username']",
+        "input[type='email']",
+    ]
+
+    username_field = None
+    for sel in username_selectors:
+        try:
+            page.wait_for_selector(sel, state="visible", timeout=15_000)
+            username_field = sel
+            print(f"   Found email field via: {sel}")
+            break
+        except PWTimeout:
+            print(f"   Selector not found: {sel} — trying next …")
+            continue
+
+    if not username_field:
+        save_debug_screenshot(page, "login_page_not_found")
+        raise RuntimeError(
+            "❌ Could not find the LinkedIn login form. "
+            "See login_page_not_found.png for what the browser saw. "
+            "LinkedIn may be showing a CAPTCHA or different page layout."
+        )
+
+    # ── 3. Fill credentials ────────────────────────────────────────────────────
+    print("   Entering email …")
+    page.click(username_field)
+    human_delay(0.5, 1.0)
+    page.fill(username_field, LINKEDIN_EMAIL)
+    human_delay(0.8, 1.5)
+
+    password_selectors = [
+        "#password",
+        "input[name='session_password']",
+        "input[type='password']",
+    ]
+
+    password_field = None
+    for sel in password_selectors:
+        try:
+            page.wait_for_selector(sel, state="visible", timeout=8_000)
+            password_field = sel
+            break
+        except PWTimeout:
+            continue
+
+    if not password_field:
+        save_debug_screenshot(page, "password_field_not_found")
+        raise RuntimeError("❌ Could not find the LinkedIn password field.")
+
+    print("   Entering password …")
+    page.click(password_field)
+    human_delay(0.5, 1.0)
+    page.fill(password_field, LINKEDIN_PASSWORD)
+    human_delay(1.0, 2.0)
+
+    # ── 4. Submit ──────────────────────────────────────────────────────────────
+    print("   Clicking Sign In …")
+    submit_selectors = [
+        "button[type='submit']",
+        "button[data-litms-control-urn='login-submit']",
+        ".login__form_action_container button",
+    ]
+    for sel in submit_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=5_000):
+                btn.click()
+                break
+        except Exception:
+            continue
+
+    # Wait for navigation after login
+    page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    human_delay(4, 7)
+
+    # ── 5. Check for security checkpoint ──────────────────────────────────────
+    current_url = page.url
+    print(f"   Post-login URL: {current_url}")
+
+    if "checkpoint" in current_url or "challenge" in current_url:
+        save_debug_screenshot(page, "security_checkpoint")
+        raise RuntimeError(
+            "🚫 LinkedIn is asking for a security verification (CAPTCHA / phone/email check). "
+            "Please log into this LinkedIn account manually in a real browser, "
+            "complete the verification, then re-run the GitHub Action."
+        )
+
+    if "feed" in current_url or "mynetwork" in current_url or "linkedin.com/in/" in current_url:
+        print("   ✅ Logged in successfully!")
+    else:
+        save_debug_screenshot(page, "unexpected_post_login_page")
+        print(f"   ⚠️  Unexpected URL after login: {current_url} — continuing anyway …")
+
+
 def extract_posts(page) -> list[dict]:
-    """Pull post data from the rendered page."""
+    """Extract up to 6 posts from the current page."""
     posts = []
 
-    # Wait for at least one post card to appear
-    try:
-        page.wait_for_selector(
-            ".feed-shared-update-v2, .occludable-update",
-            timeout=15_000,
-        )
-    except Exception:
-        print("⚠️  Could not find post elements — page structure may have changed.")
+    # Try multiple container selectors LinkedIn has used over time
+    container_selectors = [
+        ".feed-shared-update-v2",
+        ".occludable-update",
+        "[data-urn*='activity']",
+        ".profile-creator-shared-feed-update__container",
+    ]
+
+    post_elements = []
+    for sel in container_selectors:
+        try:
+            page.wait_for_selector(sel, timeout=15_000)
+            post_elements = page.query_selector_all(sel)
+            if post_elements:
+                print(f"   Found {len(post_elements)} elements via: {sel}")
+                break
+        except PWTimeout:
+            print(f"   Selector not found: {sel}")
+            continue
+
+    if not post_elements:
+        save_debug_screenshot(page, "no_posts_found")
+        print("   ⚠️  Could not find any post elements — see no_posts_found.png")
         return posts
 
-    post_elements = page.query_selector_all(
-        ".feed-shared-update-v2, .occludable-update"
-    )
-
-    print(f"   Found {len(post_elements)} post elements on page")
-
-    for el in post_elements[:10]:  # scan up to 10 to get 6 real posts
+    for el in post_elements[:12]:  # scan up to 12 to find 6 real ones
         try:
-            # Skip sponsored / ads
+            # Skip ads / sponsored
             sponsored = el.query_selector(".feed-shared-actor__sub-description")
             if sponsored and "promoted" in (sponsored.inner_text() or "").lower():
                 continue
 
-            # Post text
+            # Post text — try multiple selectors
             text_el = (
                 el.query_selector(".feed-shared-update-v2__description")
                 or el.query_selector(".feed-shared-text")
+                or el.query_selector(".break-words")
                 or el.query_selector("[data-test-id='main-feed-activity-card__commentary']")
             )
 
-            # Timestamp / date
-            time_el = el.query_selector("time")
-
-            # Image (if any)
-            image_el = (
-                el.query_selector(".feed-shared-image__image")
-                or el.query_selector(".update-components-image__image")
-            )
-
-            # Clickable link to the post
-            link_el = el.query_selector("a.app-aware-link[href*='activity']")
-
             raw_text = text_el.inner_text().strip() if text_el else ""
-
-            # Skip empty posts
             if not raw_text:
                 continue
 
-            post = {
+            # Date
+            time_el  = el.query_selector("time")
+
+            # Image
+            image_el = (
+                el.query_selector(".feed-shared-image__image")
+                or el.query_selector(".update-components-image__image")
+                or el.query_selector("img.ivm-view-attr__img--centered")
+            )
+
+            # Post link
+            link_el = (
+                el.query_selector("a[href*='/feed/update/']")
+                or el.query_selector("a.app-aware-link[href*='activity']")
+            )
+
+            posts.append({
                 "text":      raw_text,
                 "date":      time_el.get_attribute("datetime") if time_el else "",
                 "image_url": image_el.get_attribute("src") if image_el else "",
-                "post_url":  (link_el.get_attribute("href") if link_el else LINKEDIN_PROFILE_URL),
-            }
-            posts.append(post)
+                "post_url":  link_el.get_attribute("href") if link_el else LINKEDIN_PROFILE_URL,
+            })
 
             if len(posts) == 6:
                 break
 
         except Exception as e:
-            print(f"   ⚠️  Skipping a post due to error: {e}")
+            print(f"   ⚠️  Skipping post: {e}")
             continue
 
     return posts
@@ -100,8 +255,7 @@ def extract_posts(page) -> list[dict]:
 def scrape() -> None:
     if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD or not LINKEDIN_PROFILE_URL:
         raise ValueError(
-            "Missing environment variables. "
-            "Set LINKEDIN_EMAIL, LINKEDIN_PASSWORD, LINKEDIN_PROFILE_URL."
+            "Missing env vars. Set LINKEDIN_EMAIL, LINKEDIN_PASSWORD, LINKEDIN_PROFILE_URL."
         )
 
     print("🚀 Starting LinkedIn scraper …")
@@ -114,7 +268,9 @@ def scrape() -> None:
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
-                "--window-size=1280,900",
+                "--disable-extensions",
+                "--window-size=1366,768",
+                "--start-maximized",
             ],
         )
 
@@ -124,70 +280,61 @@ def scrape() -> None:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1366, "height": 768},
             locale="en-US",
             timezone_id="America/New_York",
+            java_script_enabled=True,
+            accept_downloads=False,
         )
+
+        # Set a longer default timeout on the context level
+        context.set_default_timeout(DEFAULT_TIMEOUT)
 
         page = context.new_page()
 
-        # Apply stealth patches to hide automation signals
+        # Apply stealth patches
         stealth_sync(page)
 
-        # ── Step 1: Open LinkedIn login page ──────────────────────────────────
-        print("   Opening LinkedIn login page …")
-        page.goto("https://www.linkedin.com/login", wait_until="networkidle")
-        human_delay(2, 4)
+        try:
+            # ── LOGIN ──────────────────────────────────────────────────────────
+            do_login(page)
 
-        # ── Step 2: Fill credentials ──────────────────────────────────────────
-        print("   Entering credentials …")
-        page.fill("#username", LINKEDIN_EMAIL)
-        human_delay(0.8, 1.5)
-        page.fill("#password", LINKEDIN_PASSWORD)
-        human_delay(1.0, 2.0)
+            # ── NAVIGATE TO CLIENT PROFILE ─────────────────────────────────────
+            print(f"   Navigating to: {LINKEDIN_PROFILE_URL}")
+            page.goto(LINKEDIN_PROFILE_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+            human_delay(4, 7)
 
-        # ── Step 3: Click Sign In ─────────────────────────────────────────────
-        print("   Clicking Sign In …")
-        page.click('[type="submit"]')
-        page.wait_for_load_state("networkidle")
-        human_delay(4, 7)
+            save_debug_screenshot(page, "profile_page_loaded")
 
-        # Detect security challenge / CAPTCHA
-        if "checkpoint" in page.url or "challenge" in page.url:
+            # ── SCROLL TO LOAD POSTS ───────────────────────────────────────────
+            print("   Scrolling to load posts …")
+            scroll_slowly(page, steps=5)
+
+            # ── EXTRACT ────────────────────────────────────────────────────────
+            print("   Extracting posts …")
+            posts = extract_posts(page)
+
+        except Exception as e:
+            save_debug_screenshot(page, "error_state")
             browser.close()
-            raise RuntimeError(
-                "🚫 LinkedIn is asking for a security challenge. "
-                "Log into this LinkedIn account manually once to clear it, then retry."
-            )
-
-        print("   ✅ Logged in successfully")
-
-        # ── Step 4: Navigate to client's activity page ────────────────────────
-        print(f"   Navigating to: {LINKEDIN_PROFILE_URL}")
-        page.goto(LINKEDIN_PROFILE_URL, wait_until="networkidle")
-        human_delay(3, 6)
-
-        # ── Step 5: Scroll to trigger lazy-loaded posts ───────────────────────
-        print("   Scrolling to load posts …")
-        scroll_slowly(page, steps=5)
-
-        # ── Step 6: Extract posts ─────────────────────────────────────────────
-        print("   Extracting posts …")
-        posts = extract_posts(page)
+            raise e
 
         browser.close()
 
-    # ── Step 7: Write output ──────────────────────────────────────────────────
+    # ── WRITE OUTPUT ───────────────────────────────────────────────────────────
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "post_count": len(posts),
-        "posts": posts,
+        "posts":      posts,
     }
 
     with open("posts.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"✅ Done! Scraped {len(posts)} posts → posts.json")
+
+    if len(posts) == 0:
+        print("⚠️  WARNING: 0 posts scraped. Check the debug screenshots uploaded as artifacts.")
 
 
 if __name__ == "__main__":
