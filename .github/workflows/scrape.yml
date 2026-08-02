@@ -48,6 +48,7 @@ jobs:
             *.png
             *.html
             *.txt
+            *.json
           if-no-files-found: ignore
           retention-days: 3
 
