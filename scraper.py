@@ -235,15 +235,108 @@ async (username) => {
 
 
 def call_voyager_api(page, username):
-    """Call LinkedIn's Voyager API from within the authenticated feed page."""
-    # Wait before calling the API so LinkedIn doesn't rate-limit the session.
-    # A fresh session hitting the API immediately often gets a 429.
-    print("   Waiting 15s before API call (rate-limit warm-up) …")
-    time.sleep(15)
+    """
+    Call LinkedIn's Voyager API from within the authenticated feed page.
+    Retries are done at the Python level so the page context is kept alive
+    between attempts (JS-level sleeps can destroy the execution context).
+    """
+    # Single-attempt JS — no sleep/retry inside JS to prevent context destruction
+    VOYAGER_SINGLE_JS = """
+async (username) => {
+    const getCsrf = () => {
+        const m = document.cookie.match(/JSESSIONID=([^;]+)/);
+        if (!m) return '';
+        return m[1].replace(/^"/, '').replace(/"$/, '');
+    };
+    const csrf = getCsrf();
+    const headers = {
+        'accept': 'application/vnd.linkedin.normalized+json+2.1',
+        'csrf-token': csrf,
+        'x-li-lang': 'en_US',
+        'x-li-page-instance': 'urn:li:page:d_flagship3_profile_view_base;',
+        'x-restli-protocol-version': '2.0.0',
+        'x-li-track': '{"clientVersion":"1.13.10516","mpVersion":"1.13.10516","osName":"web","timezoneOffset":0,"timezone":"America/New_York","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
+    };
+    try {
+        // Step 1: Get profile entity URN
+        const profResp = await fetch(
+            `/voyager/api/identity/profiles/${username}?projection=(id,entityUrn)`,
+            { headers, credentials: 'include' }
+        );
+        if (!profResp.ok) {
+            const body = await profResp.text();
+            return { status: profResp.status, error: 'profile_failed', body: body.substring(0, 300) };
+        }
+        const profData = await profResp.json();
+        const entityUrn = (profData.data && profData.data.entityUrn) || profData.entityUrn || '';
+        if (!entityUrn) {
+            return { status: 200, error: 'no_urn', sample: JSON.stringify(profData).substring(0, 500) };
+        }
+
+        // Step 2: Get posts
+        const encodedUrn = encodeURIComponent(entityUrn);
+        const postsResp = await fetch(
+            `/voyager/api/feed/updates?profileId=${encodedUrn}&count=15&moduleKey=memberFeedModule&includeLongTermHistory=true`,
+            { headers, credentials: 'include' }
+        );
+        if (!postsResp.ok) {
+            return { status: postsResp.status, error: 'posts_failed', entityUrn };
+        }
+        const postsData = await postsResp.json();
+        return { status: 200, success: true, entityUrn, data: postsData };
+    } catch(e) {
+        return { status: 0, error: e.toString() };
+    }
+}
+"""
+
+    max_attempts = 4
+    wait_times   = [15, 30, 60, 90]  # seconds between retries
+
     print(f"   Calling Voyager API for: {username}")
-    # Use a long timeout — the JS retries can wait up to 2 minutes total.
-    result = page.evaluate(VOYAGER_JS, username)
-    return result
+
+    for attempt in range(max_attempts):
+        wait = wait_times[attempt]
+        print(f"   Waiting {wait}s before attempt {attempt + 1} …")
+        time.sleep(wait)
+
+        # Keep page alive with a scroll between retries
+        try:
+            page.evaluate("window.scrollBy(0, 100)")
+        except Exception:
+            pass
+
+        try:
+            result = page.evaluate(VOYAGER_SINGLE_JS, username)
+        except Exception as e:
+            print(f"   ⚠️  page.evaluate error on attempt {attempt + 1}: {e}")
+            continue
+
+        status = result.get("status", 0)
+        print(f"   Attempt {attempt + 1}: status={status}")
+
+        if result.get("success"):
+            return result
+
+        if status == 429:
+            print(f"   Rate-limited (429) — will retry after longer wait")
+            continue
+
+        if result.get("error") == "no_urn":
+            print(f"   Got profile but no URN. Sample: {result.get('sample', '')[:300]}")
+            break  # Retrying won't help
+
+        if result.get("error"):
+            print(f"   Error: {result['error']}")
+            if "body" in result:
+                print(f"   Body: {result['body']}")
+            if status not in (429, 0):
+                break  # Non-retriable error
+
+    print("   ❌ All Voyager API attempts exhausted")
+    return {}
+
+
 
 
 def parse_voyager_posts(api_result, username):
