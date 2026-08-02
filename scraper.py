@@ -166,38 +166,40 @@ def find_activity_query_id_in_js(session: requests.Session, html_content: str) -
     Download LinkedIn JS bundles and search for the activity queryId hash.
     This is how services like Proxycurl/RapidAPI discover the current queryId.
     """
-    # Extract script URLs
-    script_urls = re.findall(
-        r'<script[^>]+src="(https://static\.licdn\.com/sc/h/[^"]+\.js)"',
-        html_content
-    )
-    # Also check webpack/litmus bundle URLs
-    script_urls += re.findall(
-        r'<script[^>]+src="(/sc/h/[^"]+\.js)"',
-        html_content
-    )
-    script_urls = [u if u.startswith("http") else f"https://www.linkedin.com{u}" for u in script_urls]
+    # Extract script URLs with robust regex matching
+    raw_matches = re.findall(r'src=["\']([^"\']+\.js[^"\']*)["\']', html_content, re.IGNORECASE)
+    script_urls = []
+    for u in raw_matches:
+        if "licdn" in u or "/sc/" in u or "voyager" in u or "static" in u:
+            full_u = u if u.startswith("http") else f"https://www.linkedin.com{u}" if u.startswith("/") else f"https://static.licdn.com/{u}"
+            if full_u not in script_urls:
+                script_urls.append(full_u)
 
     print(f"   Found {len(script_urls)} JS bundles to scan for queryId")
 
-    for url in script_urls[:15]:
+    all_found_qids = set()
+    for url in script_urls[:25]:
         try:
             r = session.get(url, timeout=30)
             if r.status_code != 200:
                 continue
             js = r.text
-            for name in ACTIVITY_QUERY_NAMES:
-                # Pattern: "queryId":"voyagerIdentityDashProfileUpdates.abc123"
-                m = re.search(rf'["\']?{re.escape(name)}\.([a-f0-9]{{16,40}})["\']?', js)
-                if m:
-                    query_id = f"{name}.{m.group(1)}"
-                    print(f"   ✅ Found activity queryId in JS: {query_id}")
-                    return query_id
+            # Look for any voyager queryId in JS
+            qids = re.findall(r'["\']?(voyager[A-Za-z0-9]+\.[a-f0-9]{16,40})["\']?', js)
+            for q in qids:
+                all_found_qids.add(q)
+                if any(name in q for name in ACTIVITY_QUERY_NAMES):
+                    print(f"   ✅ Found target activity queryId in JS: {q}")
+                    return q
         except Exception as e:
             print(f"   JS scan error for {url[-50:]}: {e}")
 
+    if all_found_qids:
+        print(f"   Found {len(all_found_qids)} generic queryIds in JS: {list(all_found_qids)[:5]}")
+
     print("   ⚠️ Could not find activity queryId in JS bundles")
     return ""
+
 
 
 # ═══════════════════════════════════════════════════════════════
