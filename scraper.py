@@ -132,26 +132,30 @@ def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
     code_blocks = re.findall(r'<code[^>]*>(.*?)</code>', html_content, re.DOTALL)
     print(f"   Found {len(code_blocks)} <code> tags in response HTML")
 
-    # ── DIAGNOSTIC: dump every code block to file ──────────────────────────
+    # ── DIAGNOSTIC: dump every code block to file AND stdout ──────────────
     debug_lines = []
     for i, raw_block in enumerate(code_blocks):
         cleaned = raw_block.strip()
         if cleaned.startswith("<!--") and cleaned.endswith("-->"):
             cleaned = cleaned[4:-3].strip()
         cleaned = html.unescape(cleaned)
+        # Print to log for instant inspection
+        preview = cleaned[:300].replace('\n', ' ')
+        print(f"   [Block {i:02d}] len={len(cleaned):6d}  starts: {preview[:120]}")
         debug_lines.append(f"=== CODE BLOCK {i} (len={len(cleaned)}) ===")
-        debug_lines.append(cleaned[:2000])   # first 2000 chars of each block
+        debug_lines.append(cleaned[:2000])
         debug_lines.append("")
 
     with open("code_tags_debug.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(debug_lines))
-    print(f"   📄 Saved code_tags_debug.txt ({len(debug_lines)} lines)")
+    print(f"   📄 Saved code_tags_debug.txt")
 
-    # Also save the first 200KB of the raw HTML for inspection
+    # Save first 200KB of raw HTML
     with open("raw_response.html", "w", encoding="utf-8") as f:
         f.write(html_content[:200_000])
     print(f"   📄 Saved raw_response.html (first 200KB of {len(html_content)} bytes)")
-    # ── END DIAGNOSTIC ──────────────────────────────────────────────────────
+    # ── END DIAGNOSTIC ─────────────────────────────────────────────────────
+
 
     for raw_block in code_blocks:
         cleaned = raw_block.strip()
