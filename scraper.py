@@ -458,21 +458,33 @@ def scrape() -> None:
     request_blocks, response_blocks = parse_code_blocks(html_content) if html_content else ([], [])
     print(f"   Parsed {len(request_blocks)} request blocks, {len(response_blocks)} response blocks")
 
+    print("\n   --- Embedded Request Blocks ---")
+    for req in request_blocks:
+        print(f"   req: {req.get('url', '')[:110]}")
+
     # Extract David's profile URN from embedded response data
     profile_urn = extract_profile_urn(response_blocks, username)
 
-    # Extract profile GraphQL URL used by the page (we'll re-use its queryId format)
+    # Extract profile GraphQL URL used by the page
     profile_gql_url = extract_profile_graphql_url(request_blocks, username)
+
+    # Try parsing posts directly from response blocks embedded in HTML
+    posts = []
+    for resp_block in response_blocks:
+        found_p = parse_api_response(resp_block, username)
+        if found_p:
+            print(f"   ✅ Extracted {len(found_p)} posts directly from embedded HTML code block!")
+            posts.extend(found_p)
+            if len(posts) >= 6:
+                break
 
     # ── Step 3: Discover activity queryId from JS bundles ────────────────────
     activity_query_id = ""
-    if html_content:
+    if not posts and html_content:
         activity_query_id = find_activity_query_id_in_js(session, html_content)
 
     # ── Step 4: Call GraphQL with discovered queryId ──────────────────────────
-    posts = []
-
-    if activity_query_id and csrf:
+    if not posts and activity_query_id and csrf:
         # Try with vanity name
         variables_vanity = f"(vanityName:{username},count:6,start:0)"
         posts = call_graphql(session, "activity_vanity", activity_query_id,
@@ -498,10 +510,10 @@ def scrape() -> None:
             profile_query_id = m.group(1)
 
         if profile_query_id and csrf:
-            # Maybe the same query accepts activity variables (worth trying)
             variables = f"(memberIdentity:{username},count:6,start:0)"
             posts = call_graphql(session, "profile_qid_activity", profile_query_id,
                                  variables, csrf, username)
+
 
     # ── Final output ──────────────────────────────────────────────────────────
     if not posts:
