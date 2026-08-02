@@ -2,11 +2,11 @@ name: LinkedIn Post Scraper
 
 on:
   schedule:
-    - cron: '0 7 * * *'   # Daily at 7:00 AM UTC
-  workflow_dispatch:        # Manual trigger from Actions tab
+    - cron: '0 7 * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: write           # To commit posts.json
+  contents: write
 
 jobs:
   scrape-linkedin:
