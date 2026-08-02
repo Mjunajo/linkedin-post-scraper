@@ -43,10 +43,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: debug-artifacts
           path: |
             *.png
-            page_body_snippet.txt
+            *.html
+            *.txt
           if-no-files-found: ignore
           retention-days: 3
 
