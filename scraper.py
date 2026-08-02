@@ -14,6 +14,20 @@ GH_PAT               = os.environ.get("GH_PAT", "")
 GITHUB_REPOSITORY    = os.environ.get("GITHUB_REPOSITORY", "")
 # ──────────────────────────────────────────────────────────────────────────────
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "Sec-Ch-Ua":                 '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
+
 
 def extract_username_from_url(url: str) -> str:
     match = re.search(r'linkedin\.com/in/([^/?#]+)', url)
@@ -56,11 +70,11 @@ def refresh_github_secret(secret_name: str, new_value: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# PAYLOAD PARSER (HTML <code> EMBEDDED JSON)
+# VOYAGER API PARSER
 # ═══════════════════════════════════════════════════════════════
 
 def _extract_text_from_item(item: dict) -> str:
-    # 1. Commentary
+    # 1. Commentary (standard post text field)
     commentary = item.get("commentary")
     if isinstance(commentary, dict):
         text_obj = commentary.get("text")
@@ -117,142 +131,85 @@ def _extract_image_from_item(item: dict) -> str:
 
 
 def _extract_post_url_from_item(item: dict, username: str) -> str:
-    entity_urn = item.get("entityUrn") or item.get("urn") or ""
-    if "activity:" in entity_urn or "share:" in entity_urn:
+    entity_urn = item.get("entityUrn") or item.get("urn") or item.get("*urn") or ""
+    if "activity:" in entity_urn or "share:" in entity_urn or "ugcPost:" in entity_urn:
         act_id = entity_urn.split(":")[-1]
         return f"https://www.linkedin.com/feed/update/urn:li:activity:{act_id}/"
     return f"https://www.linkedin.com/in/{username}/recent-activity/all/"
 
 
-def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
+SKIP_PREFIXES = (
+    "Web Developer", "Experience", "Education", "Contact info",
+    "urn:", "com.linkedin", "http", "AQ", "AAZ", "ajax:",
+)
+
+
+def _is_valid_post_text(text: str) -> bool:
+    if len(text) < 20:
+        return False
+    if any(text.startswith(p) for p in SKIP_PREFIXES):
+        return False
+    return True
+
+
+def parse_voyager_response(data: dict, username: str) -> list[dict]:
+    """
+    Parse a Voyager API normalized JSON response.
+    Format: {"data": {..., "elements": [...]}, "included": [...]}
+    """
     posts = []
-    seen_texts = set()
+    seen = set()
 
-    # Find all <code>...</code> blocks in the HTML
-    code_blocks = re.findall(r'<code[^>]*>(.*?)</code>', html_content, re.DOTALL)
-    print(f"   Found {len(code_blocks)} <code> tags in response HTML")
+    items = []
 
-    # ── DIAGNOSTIC: dump every code block to file AND stdout ──────────────
-    debug_lines = []
-    for i, raw_block in enumerate(code_blocks):
-        cleaned = raw_block.strip()
-        if cleaned.startswith("<!--") and cleaned.endswith("-->"):
-            cleaned = cleaned[4:-3].strip()
-        cleaned = html.unescape(cleaned)
-        # Print to log for instant inspection
-        preview = cleaned[:300].replace('\n', ' ')
-        print(f"   [Block {i:02d}] len={len(cleaned):6d}  starts: {preview[:120]}")
-        debug_lines.append(f"=== CODE BLOCK {i} (len={len(cleaned)}) ===")
-        debug_lines.append(cleaned[:2000])
-        debug_lines.append("")
+    if not isinstance(data, dict):
+        return posts
 
-    with open("code_tags_debug.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(debug_lines))
-    print(f"   📄 Saved code_tags_debug.txt")
+    # Top-level included (Voyager REST format)
+    if "included" in data and isinstance(data["included"], list):
+        items.extend(data["included"])
 
-    # Save first 200KB of raw HTML
-    with open("raw_response.html", "w", encoding="utf-8") as f:
-        f.write(html_content[:200_000])
-    print(f"   📄 Saved raw_response.html (first 200KB of {len(html_content)} bytes)")
-    # ── END DIAGNOSTIC ─────────────────────────────────────────────────────
+    top = data.get("data", {})
+    if isinstance(top, dict):
+        # data.elements (collection response)
+        for elem in top.get("elements", []):
+            if isinstance(elem, dict):
+                items.append(elem)
+        # data.data (GraphQL double-wrapper)
+        inner = top.get("data")
+        if isinstance(inner, dict):
+            items.append(inner)
+            for v in inner.values():
+                if isinstance(v, dict) and "elements" in v:
+                    items.extend(v.get("elements", []))
+                elif isinstance(v, list):
+                    items.extend(v)
 
-
-    for idx, raw_block in enumerate(code_blocks):
-        cleaned = raw_block.strip()
-
-        # Strip HTML comment wrappers <!-- ... -->
-        if cleaned.startswith("<!--") and cleaned.endswith("-->"):
-            cleaned = cleaned[4:-3].strip()
-
-        cleaned = html.unescape(cleaned)
-
-        if not (cleaned.startswith("{") or cleaned.startswith("[")):
+    for item in items:
+        if not isinstance(item, dict):
             continue
 
-        try:
-            data = json.loads(cleaned)
-        except Exception:
+        text = _extract_text_from_item(item)
+
+        # Deeper search in nested dicts
+        if not text:
+            for k in ("value", "actor", "content", "updateMetadata"):
+                nested = item.get(k)
+                if isinstance(nested, dict):
+                    text = _extract_text_from_item(nested)
+                    if text:
+                        break
+
+        if not text or text in seen or not _is_valid_post_text(text):
             continue
 
-        # Build the list of items to inspect for post content.
-        # LinkedIn's code blocks use several formats:
-        #   1. Voyager REST:  {"data": {...}, "included": [...]}
-        #   2. Collection:    {"data": {"elements": [...], ...}}
-        #   3. GraphQL:       {"data": {"data": {"identityDash...": {...}}}}
-        items = []
-
-        if isinstance(data, dict):
-            top_data = data.get("data", {})
-
-            # Format 1: top-level included array
-            if "included" in data and isinstance(data["included"], list):
-                items.extend(data["included"])
-
-            # Format 2: data.elements array (Block 00 — the activity collection)
-            if isinstance(top_data, dict) and "elements" in top_data:
-                elems = top_data["elements"]
-                if isinstance(elems, list):
-                    items.extend(elems)
-
-            # Format 3: data.data (GraphQL double-wrapper, Blocks 14 & 16)
-            if isinstance(top_data, dict) and "data" in top_data:
-                inner = top_data["data"]
-                if isinstance(inner, dict):
-                    items.append(inner)
-                    # Recursively extract any nested elements/included
-                    for v in inner.values():
-                        if isinstance(v, dict) and "elements" in v:
-                            items.extend(v["elements"])
-                        if isinstance(v, list):
-                            items.extend(v)
-
-            # Also treat top_data itself as an item
-            if isinstance(top_data, dict):
-                items.append(top_data)
-
-        elif isinstance(data, list):
-            items.extend(data)
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            text = _extract_text_from_item(item)
-
-            # Deeper search: look inside nested value/content dicts
-            if not text:
-                for nested_key in ("value", "actor", "content", "updateMetadata"):
-                    nested = item.get(nested_key)
-                    if isinstance(nested, dict):
-                        text = _extract_text_from_item(nested)
-                        if text:
-                            break
-
-            if not text or len(text) < 20 or text in seen_texts:
-                continue
-
-            # Skip non-post strings
-            skip_prefixes = (
-                "Web Developer", "Experience", "Education", "Contact info",
-                "urn:", "com.linkedin", "http", "AQ", "AAZ",
-            )
-            if any(text.startswith(p) for p in skip_prefixes):
-                continue
-
-            seen_texts.add(text)
-            date      = _extract_date_from_item(item)
-            image_url = _extract_image_from_item(item)
-            post_url  = _extract_post_url_from_item(item, username)
-
-            posts.append({
-                "text":      text,
-                "date":      date,
-                "image_url": image_url,
-                "post_url":  post_url,
-            })
-
-            if len(posts) >= 6:
-                break
+        seen.add(text)
+        posts.append({
+            "text":      text,
+            "date":      _extract_date_from_item(item),
+            "image_url": _extract_image_from_item(item),
+            "post_url":  _extract_post_url_from_item(item, username),
+        })
 
         if len(posts) >= 6:
             break
@@ -261,71 +218,138 @@ def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SINGLE DIRECT REQUEST SCRAPER
+# SESSION & CSRF SETUP
 # ═══════════════════════════════════════════════════════════════
 
-def fetch_posts_direct(username: str) -> list[dict]:
-    session = requests.Session()
+def build_session() -> requests.Session:
+    s = requests.Session()
+    s.cookies.set("li_at", LI_AT_COOKIE, domain=".linkedin.com")
+    return s
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
+
+def get_csrf_token(session: requests.Session) -> str:
+    """
+    Load the LinkedIn feed page to receive JSESSIONID cookie.
+    LinkedIn's CSRF token = JSESSIONID cookie value (without quotes).
+    """
+    print("   Loading feed page to obtain CSRF token …")
+    try:
+        resp = session.get(
+            "https://www.linkedin.com/feed/",
+            headers={**BROWSER_HEADERS, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+            timeout=30,
+        )
+        print(f"   Feed status: {resp.status_code}")
+
+        # Auto-refresh if li_at changed
+        for c in session.cookies:
+            if c.name == "li_at" and c.value and c.value != LI_AT_COOKIE:
+                refresh_github_secret("LINKEDIN_LI_AT", c.value)
+                break
+
+    except Exception as e:
+        print(f"   ⚠️ Feed load notice: {e}")
+
+    for c in session.cookies:
+        if c.name == "JSESSIONID":
+            return c.value.strip('"')
+
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════
+# VOYAGER API CALL
+# ═══════════════════════════════════════════════════════════════
+
+def voyager_api_headers(csrf: str, referer: str) -> dict:
+    return {
+        **BROWSER_HEADERS,
+        "Accept":                     "application/vnd.linkedin.normalized+json+2.1",
+        "Accept-Language":            "en-US,en;q=0.9",
+        "csrf-token":                 csrf,
+        "x-restli-protocol-version":  "2.0.0",
+        "x-li-lang":                  "en_US",
+        "x-li-track": json.dumps({
+            "clientVersion": "1.13.13993",
+            "mpVersion":     "1.13.13993",
+            "osName":        "web",
+            "timezoneOffset": -5,
+            "timezone":      "America/New_York",
+            "deviceFormFactor": "DESKTOP",
+            "mpName":        "voyager-web",
+            "displayDensity": 1,
+            "displayWidth":   1366,
+            "displayHeight":  768,
+        }),
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
+        "Referer":        referer,
+        "Origin":         "https://www.linkedin.com",
     }
 
-    if LI_AT_COOKIE:
-        session.cookies.set("li_at", LI_AT_COOKIE, domain=".linkedin.com")
-        print("   ✅ Session cookie set")
 
-    target_urls = [
-        f"https://www.linkedin.com/in/{username}/recent-activity/all/",
-        f"https://www.linkedin.com/in/{username}/",
-    ]
+def fetch_posts_via_api(session: requests.Session, username: str, csrf: str) -> list[dict]:
+    """
+    Call Voyager API endpoints directly.
+    Tries two endpoints: profileUpdatesV2 (REST) and the GraphQL activity query.
+    """
+    referer = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
+    hdrs    = voyager_api_headers(csrf, referer)
 
-    posts = []
-    for url in target_urls:
-        print(f"   GET {url} ...")
-        try:
-            resp = session.get(url, headers=headers, allow_redirects=True, timeout=30)
-            print(f"   Response status: {resp.status_code} | Final URL: {resp.url}")
+    # ── Endpoint 1: profileUpdatesV2 (classic REST) ──────────────────────
+    url1    = "https://www.linkedin.com/voyager/api/identity/profileUpdatesV2"
+    params1 = {"memberIdentity": username, "count": 6, "start": 0, "includeLongTermHistory": "true"}
+    print(f"\n   Calling Voyager REST: {url1}")
+    try:
+        r = session.get(url1, headers=hdrs, params=params1, timeout=30)
+        print(f"   Status: {r.status_code}")
+        with open("voyager_response.json", "w") as f:
+            f.write(r.text[:50_000])
 
-            # Check if cookie was updated in response
-            for cookie in session.cookies:
-                if cookie.name == "li_at" and cookie.value and cookie.value != LI_AT_COOKIE:
-                    print("   🔄 Session cookie updated by server — auto-refreshing secret ...")
-                    refresh_github_secret("LINKEDIN_LI_AT", cookie.value)
-                    break
+        if r.status_code == 200:
+            posts = parse_voyager_response(r.json(), username)
+            if posts:
+                return posts
+        elif r.status_code == 429:
+            print("   ⚠️ 429 Rate-limited — account needs more trust (see note below)")
+        else:
+            print(f"   ⚠️ Unexpected status {r.status_code}")
+    except Exception as e:
+        print(f"   ⚠️ REST API error: {e}")
 
-            if resp.status_code == 200:
-                posts = parse_linkedin_html_payload(resp.text, username)
-                if posts:
-                    print(f"   ✅ Successfully extracted {len(posts)} posts from {url}")
-                    break
-        except Exception as e:
-            print(f"   ⚠️ Request notice: {e}")
+    # ── Endpoint 2: GraphQL activity ──────────────────────────────────────
+    url2 = (
+        "https://www.linkedin.com/voyager/api/graphql"
+        "?variables=(profileIdentity:(vanityName:" + username + "),count:6,start:0)"
+        "&queryId=voyagerIdentityDashProfileUpdates.4a16ce71b8b9c0bfbf35abe10f75e8f8"
+    )
+    print(f"\n   Calling Voyager GraphQL: {url2[:90]}…")
+    try:
+        r2 = session.get(url2, headers={**hdrs, "Accept": "application/json"}, timeout=30)
+        print(f"   Status: {r2.status_code}")
+        with open("voyager_graphql_response.json", "w") as f:
+            f.write(r2.text[:50_000])
 
-    return posts
+        if r2.status_code == 200:
+            posts = parse_voyager_response(r2.json(), username)
+            if posts:
+                return posts
+        elif r2.status_code == 429:
+            print("   ⚠️ 429 Rate-limited on GraphQL too")
+    except Exception as e:
+        print(f"   ⚠️ GraphQL API error: {e}")
+
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN SCRAPE EXECUTION
+# MAIN
 # ═══════════════════════════════════════════════════════════════
 
 def scrape() -> None:
+    if not LI_AT_COOKIE:
+        raise ValueError("LINKEDIN_LI_AT secret is not set.")
     if not LINKEDIN_PROFILE_URL:
         raise ValueError("LINKEDIN_PROFILE_URL secret is not set.")
 
@@ -333,10 +357,26 @@ def scrape() -> None:
     if not username:
         raise ValueError(f"Cannot extract username from: {LINKEDIN_PROFILE_URL}")
 
-    print("🚀 Starting LinkedIn scraper (Direct Single Request) …")
+    print("🚀 Starting LinkedIn scraper (Voyager API via Python requests) …")
     print(f"   Target Username: {username}")
 
-    posts = fetch_posts_direct(username)
+    session = build_session()
+    csrf    = get_csrf_token(session)
+
+    if not csrf:
+        print("   ⚠️ No CSRF token obtained — session cookie may be invalid")
+    else:
+        print(f"   ✅ CSRF token obtained: {csrf[:20]}…")
+
+    posts = fetch_posts_via_api(session, username, csrf)
+
+    if not posts:
+        print(
+            "\n⚠️ 0 posts scraped."
+            "\n   If you see '429 Rate-limited' above, the LINKEDIN_LI_AT cookie belongs to"
+            "\n   a low-trust/new account. Update it with a cookie from an ESTABLISHED account"
+            "\n   (yours or David Territo's own account) and re-run."
+        )
 
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
