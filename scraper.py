@@ -139,7 +139,7 @@ class NetworkPostTracker:
 
     def handle_response(self, response):
         url = response.url
-        if not ("voyager/api" in url or "graphql" in url or "feed/updates" in url or "identity/profiles" in url):
+        if not ("voyager/api" in url or "graphql" in url or "feed/updates" in url or "identity/profiles" in url or "dash/channels" in url):
             return
 
         if response.status != 200:
@@ -210,31 +210,73 @@ class NetworkPostTracker:
 
 
 # ═══════════════════════════════════════════════════════════════
-# NAVIGATION TO ACTIVITY PAGE
+# ROBUST UI & SOFT NAVIGATION TO PROFILE / ACTIVITY
 # ═══════════════════════════════════════════════════════════════
 
-def navigate_to_activity_feed(page, username: str) -> None:
+def navigate_to_user_activity(page, username: str) -> None:
     """
-    Navigate directly to recent-activity/all/ URL.
-    Blocking ServiceWorkers in browser context eliminates the SPA redirect loop.
+    1. Load base profile first: https://www.linkedin.com/in/{username}/
+    2. Soft-click or soft-navigate to activity page to avoid ERR_ABORTED
     """
+    base_profile_url = f"https://www.linkedin.com/in/{username}/"
     activity_url = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
-    print(f"   Navigating directly to activity page: {activity_url}")
 
+    print(f"   Step 1: Loading base profile: {base_profile_url}")
     try:
-        page.goto(activity_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-        human_delay(4, 6)
-        print_page_info(page, "activity-page")
-        save_debug_screenshot(page, "02_activity_page")
+        page.goto(base_profile_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+        human_delay(3, 5)
+        print_page_info(page, "base-profile")
+        save_debug_screenshot(page, "02a_base_profile")
     except Exception as e:
-        print(f"   ⚠️ Navigation notice: {e}")
-        save_debug_screenshot(page, "02_activity_err")
+        print(f"   ⚠️ Base profile load notice: {e}")
 
-    # Scroll page to trigger lazy loading of posts
-    print("   Scrolling activity feed ...")
-    for i in range(7):
+    # Scroll profile to load Activity section
+    print("   Scrolling base profile ...")
+    for _ in range(4):
         page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
-        human_delay(2.0, 3.5)
+        human_delay(1.5, 2.5)
+
+    save_debug_screenshot(page, "02b_profile_scrolled")
+
+    # Step 2: Try clicking 'Show all posts' button on profile page
+    show_all_selectors = [
+        "a[href*='recent-activity']:has-text('Show all')",
+        "a[href*='recent-activity']:has-text('See all')",
+        "a[href*='recent-activity/all']",
+        "a[href*='recent-activity']",
+        ".pv-recent-activity-section a",
+        "button:has-text('Show all posts')",
+        "span:has-text('Show all posts')",
+    ]
+
+    clicked = False
+    for sel in show_all_selectors:
+        try:
+            link = page.locator(sel).first
+            if link.is_visible(timeout=3_000):
+                print(f"   ✅ Found & clicking Activity link: {sel}")
+                link.click()
+                human_delay(4, 6)
+                save_debug_screenshot(page, "02c_after_link_click")
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        print("   Step 3: Triggering soft JS location change to activity feed ...")
+        try:
+            page.evaluate(f"window.location.href = '{activity_url}'")
+            human_delay(4, 6)
+            save_debug_screenshot(page, "02c_soft_js_nav")
+        except Exception as e:
+            print(f"   ⚠️ Soft JS nav notice: {e}")
+
+    # Scroll Activity page to trigger lazy loading of post cards
+    print("   Scrolling activity feed ...")
+    for _ in range(6):
+        page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
+        human_delay(2.0, 3.0)
 
     save_debug_screenshot(page, "03_after_scroll")
 
@@ -254,7 +296,8 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
         ".artdeco-list__item",
         "li.artdeco-list__item",
         ".update-components-text",
-        ".entity-result",
+        ".pv-recent-activity-detail-v2",
+        ".pvs-entity",
     ]
 
     post_elements = []
@@ -262,7 +305,7 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
         try:
             elements = page.query_selector_all(sel)
             if elements:
-                print(f"   Found {len(elements)} DOM elements via: {sel}")
+                print(f"   Found {len(elements)} DOM elements via selector: {sel}")
                 post_elements = elements
                 break
         except Exception:
@@ -276,6 +319,7 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
                 or el.query_selector(".break-words")
                 or el.query_selector(".update-components-text")
                 or el.query_selector("[data-test-id='main-feed-activity-card__commentary']")
+                or el.query_selector("span[dir='ltr']")
             )
             raw_text = text_el.inner_text().strip() if text_el else ""
             if not raw_text or len(raw_text) < 15:
@@ -320,7 +364,7 @@ def scrape() -> None:
     if not username:
         raise ValueError(f"Cannot extract username from: {LINKEDIN_PROFILE_URL}")
 
-    print("🚀 Starting LinkedIn scraper (Direct Activity + Interceptor) …")
+    print("🚀 Starting LinkedIn scraper (Robust Navigation + Interceptor) …")
     print(f"   Target Username: {username}")
 
     with sync_playwright() as p:
@@ -337,7 +381,6 @@ def scrape() -> None:
             ],
         )
 
-        # service_workers="block" prevents ServiceWorker client-side redirect loops
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -348,7 +391,6 @@ def scrape() -> None:
             locale="en-US",
             timezone_id="America/New_York",
             java_script_enabled=True,
-            service_workers="block",
         )
         context.set_default_timeout(DEFAULT_TIMEOUT)
 
@@ -365,8 +407,8 @@ def scrape() -> None:
             # Step 1: Login check & session warmup
             verify_and_warmup_session(page)
 
-            # Step 2: Navigate directly to activity feed (with SW blocked)
-            navigate_to_activity_feed(page, username)
+            # Step 2: Robust Navigation to Profile & Activity tab
+            navigate_to_user_activity(page, username)
 
             # Step 3: Check captured posts from network response interceptor
             print(f"\n   Checking Network Interceptor results: {len(tracker.captured_posts)} posts captured")
