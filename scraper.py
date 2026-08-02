@@ -12,8 +12,7 @@ LINKEDIN_PASSWORD    = os.environ.get("LINKEDIN_PASSWORD", "")
 LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Increase all default timeouts to 60 seconds
-DEFAULT_TIMEOUT = 60_000   # ms
+DEFAULT_TIMEOUT = 60_000  # ms
 
 
 def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
@@ -27,209 +26,255 @@ def scroll_slowly(page, steps: int = 5) -> None:
 
 
 def save_debug_screenshot(page, name: str = "debug") -> None:
-    """Save a screenshot so you can see what the browser is looking at."""
     try:
-        path = f"{name}.png"
-        page.screenshot(path=path, full_page=False)
-        print(f"   📸 Screenshot saved: {path}")
+        page.screenshot(path=f"{name}.png", full_page=True)
+        print(f"   📸 Screenshot: {name}.png")
     except Exception as e:
-        print(f"   ⚠️  Could not save screenshot: {e}")
+        print(f"   ⚠️  Screenshot failed: {e}")
 
 
-def dismiss_cookie_banner(page) -> None:
-    """Dismiss any cookie consent overlay LinkedIn may show."""
-    cookie_selectors = [
-        "button[action-type='ACCEPT']",
-        "button.artdeco-global-alert__action",
-        "[data-tracking-control-name='cookie-consent-accept']",
-        "button:has-text('Accept')",
-        "button:has-text('Allow')",
-        "button:has-text('Agree')",
-    ]
-    for sel in cookie_selectors:
+def print_page_info(page, label: str = "") -> None:
+    try:
+        print(f"   [{label}] URL:   {page.url}")
+        print(f"   [{label}] Title: {page.title()}")
+    except Exception:
+        pass
+
+
+def fill_login_form(page) -> None:
+    """
+    Fill the LinkedIn login form.
+    Uses label/placeholder selectors that match LinkedIn's current (2024-2025) login page design
+    which shows 'Email or phone' and 'Password' labels — the old id='username' is gone.
+    """
+
+    # ── Email field ────────────────────────────────────────────────────────────
+    # Try in order: get_by_label (most reliable), get_by_placeholder, CSS fallbacks
+    email_locator = None
+
+    # Strategy 1: by visible label text (matches the 'Email or phone' label)
+    try:
+        loc = page.get_by_label("Email or phone")
+        loc.wait_for(state="visible", timeout=15_000)
+        email_locator = loc
+        print("   ✅ Email field found via label 'Email or phone'")
+    except Exception:
+        pass
+
+    # Strategy 2: by placeholder
+    if not email_locator:
         try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=3_000):
-                btn.click()
-                human_delay(1, 2)
-                print("   ✅ Dismissed cookie/consent banner")
-                return
+            loc = page.get_by_placeholder("Email or phone")
+            loc.wait_for(state="visible", timeout=8_000)
+            email_locator = loc
+            print("   ✅ Email field found via placeholder")
         except Exception:
-            continue
+            pass
+
+    # Strategy 3: CSS selectors (old + new)
+    if not email_locator:
+        css_selectors = [
+            "#username",
+            "input[name='session_key']",
+            "input[autocomplete='username']",
+            "input[type='email']",
+            "input[type='text']",
+            "form input:not([type='password']):not([type='hidden'])",
+        ]
+        for sel in css_selectors:
+            try:
+                page.wait_for_selector(sel, state="visible", timeout=6_000)
+                email_locator = page.locator(sel).first
+                print(f"   ✅ Email field found via CSS: {sel}")
+                break
+            except PWTimeout:
+                print(f"   — CSS selector missed: {sel}")
+                continue
+
+    if not email_locator:
+        save_debug_screenshot(page, "email_field_not_found")
+        raise RuntimeError(
+            "❌ Could not find the email/phone input field.\n"
+            "See email_field_not_found.png for what the browser showed."
+        )
+
+    print("   Typing email …")
+    email_locator.click()
+    human_delay(0.5, 1.0)
+    email_locator.type(LINKEDIN_EMAIL, delay=random.randint(60, 130))
+    human_delay(1.0, 2.0)
+
+    # ── Password field ─────────────────────────────────────────────────────────
+    password_locator = None
+
+    try:
+        loc = page.get_by_label("Password")
+        loc.wait_for(state="visible", timeout=8_000)
+        password_locator = loc
+        print("   ✅ Password field found via label 'Password'")
+    except Exception:
+        pass
+
+    if not password_locator:
+        pw_selectors = [
+            "input[type='password']",
+            "#password",
+            "input[name='session_password']",
+            "input[autocomplete='current-password']",
+        ]
+        for sel in pw_selectors:
+            try:
+                page.wait_for_selector(sel, state="visible", timeout=6_000)
+                password_locator = page.locator(sel).first
+                print(f"   ✅ Password field found via CSS: {sel}")
+                break
+            except PWTimeout:
+                continue
+
+    if not password_locator:
+        save_debug_screenshot(page, "password_field_not_found")
+        raise RuntimeError("❌ Could not find the password input field.")
+
+    print("   Typing password …")
+    password_locator.click()
+    human_delay(0.5, 1.0)
+    password_locator.type(LINKEDIN_PASSWORD, delay=random.randint(60, 130))
+    human_delay(1.0, 2.0)
+
+    # ── Submit button ──────────────────────────────────────────────────────────
+    print("   Clicking Sign in …")
+    submitted = False
+
+    # Try 'Sign in' button by text first (most reliable on new layout)
+    try:
+        btn = page.get_by_role("button", name="Sign in")
+        if btn.is_visible(timeout=5_000):
+            btn.click()
+            submitted = True
+            print("   ✅ Clicked 'Sign in' button via role+name")
+    except Exception:
+        pass
+
+    if not submitted:
+        submit_selectors = [
+            "button[type='submit']",
+            "button[data-litms-control-urn='login-submit']",
+            ".login__form_action_container button",
+            "button:has-text('Sign in')",
+        ]
+        for sel in submit_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=4_000):
+                    btn.click()
+                    submitted = True
+                    break
+            except Exception:
+                continue
+
+    if not submitted:
+        print("   ⚠️  No submit button found — pressing Enter as fallback")
+        page.keyboard.press("Enter")
 
 
 def do_login(page) -> None:
-    """Navigate to LinkedIn login and fill credentials."""
+    """Navigate to LinkedIn login page and authenticate."""
 
-    # ── 1. Go to login page ────────────────────────────────────────────────────
     print("   Opening LinkedIn login page …")
-    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    page.goto(
+        "https://www.linkedin.com/login",
+        wait_until="load",
+        timeout=DEFAULT_TIMEOUT,
+    )
+    human_delay(4, 6)
+    print_page_info(page, "login-page")
+    save_debug_screenshot(page, "01_login_page_loaded")
 
-    # Give JS time to settle
-    human_delay(3, 5)
+    # If already redirected to feed, we're already logged in
+    if "feed" in page.url or "mynetwork" in page.url:
+        print("   ✅ Already logged in!")
+        return
 
-    # Dismiss any cookie banner that blocks the form
-    dismiss_cookie_banner(page)
-    human_delay(1, 2)
+    # Fill credentials
+    fill_login_form(page)
 
-    # ── 2. Wait for the email field with multiple fallback selectors ───────────
-    print("   Waiting for login form …")
-    username_selectors = [
-        "#username",
-        "input[name='session_key']",
-        "input[autocomplete='username']",
-        "input[type='email']",
-    ]
-
-    username_field = None
-    for sel in username_selectors:
-        try:
-            page.wait_for_selector(sel, state="visible", timeout=15_000)
-            username_field = sel
-            print(f"   Found email field via: {sel}")
-            break
-        except PWTimeout:
-            print(f"   Selector not found: {sel} — trying next …")
-            continue
-
-    if not username_field:
-        save_debug_screenshot(page, "login_page_not_found")
-        raise RuntimeError(
-            "❌ Could not find the LinkedIn login form. "
-            "See login_page_not_found.png for what the browser saw. "
-            "LinkedIn may be showing a CAPTCHA or different page layout."
-        )
-
-    # ── 3. Fill credentials ────────────────────────────────────────────────────
-    print("   Entering email …")
-    page.click(username_field)
-    human_delay(0.5, 1.0)
-    page.fill(username_field, LINKEDIN_EMAIL)
-    human_delay(0.8, 1.5)
-
-    password_selectors = [
-        "#password",
-        "input[name='session_password']",
-        "input[type='password']",
-    ]
-
-    password_field = None
-    for sel in password_selectors:
-        try:
-            page.wait_for_selector(sel, state="visible", timeout=8_000)
-            password_field = sel
-            break
-        except PWTimeout:
-            continue
-
-    if not password_field:
-        save_debug_screenshot(page, "password_field_not_found")
-        raise RuntimeError("❌ Could not find the LinkedIn password field.")
-
-    print("   Entering password …")
-    page.click(password_field)
-    human_delay(0.5, 1.0)
-    page.fill(password_field, LINKEDIN_PASSWORD)
-    human_delay(1.0, 2.0)
-
-    # ── 4. Submit ──────────────────────────────────────────────────────────────
-    print("   Clicking Sign In …")
-    submit_selectors = [
-        "button[type='submit']",
-        "button[data-litms-control-urn='login-submit']",
-        ".login__form_action_container button",
-    ]
-    for sel in submit_selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=5_000):
-                btn.click()
-                break
-        except Exception:
-            continue
-
-    # Wait for navigation after login
+    # Wait for post-login navigation
+    print("   Waiting for post-login redirect …")
     page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-    human_delay(4, 7)
+    human_delay(5, 8)
+    print_page_info(page, "post-login")
+    save_debug_screenshot(page, "02_post_login")
 
-    # ── 5. Check for security checkpoint ──────────────────────────────────────
-    current_url = page.url
-    print(f"   Post-login URL: {current_url}")
-
-    if "checkpoint" in current_url or "challenge" in current_url:
-        save_debug_screenshot(page, "security_checkpoint")
+    # Evaluate result
+    url = page.url
+    if "checkpoint" in url or "challenge" in url:
         raise RuntimeError(
-            "🚫 LinkedIn is asking for a security verification (CAPTCHA / phone/email check). "
-            "Please log into this LinkedIn account manually in a real browser, "
-            "complete the verification, then re-run the GitHub Action."
+            "🚫 LinkedIn security checkpoint (phone/email verification required).\n"
+            "Log into this LinkedIn account manually in a real browser, "
+            "complete the verification once, then re-run the GitHub Action."
         )
 
-    if "feed" in current_url or "mynetwork" in current_url or "linkedin.com/in/" in current_url:
-        print("   ✅ Logged in successfully!")
-    else:
-        save_debug_screenshot(page, "unexpected_post_login_page")
-        print(f"   ⚠️  Unexpected URL after login: {current_url} — continuing anyway …")
+    if "login" in url and "feed" not in url:
+        save_debug_screenshot(page, "02b_login_failed")
+        raise RuntimeError(
+            "❌ Still on login page after submitting. "
+            "Check credentials in GitHub Secrets (LINKEDIN_EMAIL / LINKEDIN_PASSWORD)."
+        )
+
+    print("   ✅ Login successful!")
 
 
 def extract_posts(page) -> list[dict]:
-    """Extract up to 6 posts from the current page."""
     posts = []
 
-    # Try multiple container selectors LinkedIn has used over time
-    container_selectors = [
+    post_selectors = [
         ".feed-shared-update-v2",
         ".occludable-update",
         "[data-urn*='activity']",
         ".profile-creator-shared-feed-update__container",
+        ".ember-view.occludable-update",
     ]
 
     post_elements = []
-    for sel in container_selectors:
+    for sel in post_selectors:
         try:
             page.wait_for_selector(sel, timeout=15_000)
             post_elements = page.query_selector_all(sel)
             if post_elements:
-                print(f"   Found {len(post_elements)} elements via: {sel}")
+                print(f"   Found {len(post_elements)} post elements via: {sel}")
                 break
         except PWTimeout:
-            print(f"   Selector not found: {sel}")
+            print(f"   — Post selector not found: {sel}")
             continue
 
     if not post_elements:
-        save_debug_screenshot(page, "no_posts_found")
-        print("   ⚠️  Could not find any post elements — see no_posts_found.png")
+        save_debug_screenshot(page, "04_no_posts_found")
+        print("   ⚠️  No post elements found — see 04_no_posts_found.png")
         return posts
 
-    for el in post_elements[:12]:  # scan up to 12 to find 6 real ones
+    for el in post_elements[:14]:
         try:
-            # Skip ads / sponsored
+            # Skip sponsored posts
             sponsored = el.query_selector(".feed-shared-actor__sub-description")
             if sponsored and "promoted" in (sponsored.inner_text() or "").lower():
                 continue
 
-            # Post text — try multiple selectors
             text_el = (
                 el.query_selector(".feed-shared-update-v2__description")
                 or el.query_selector(".feed-shared-text")
                 or el.query_selector(".break-words")
                 or el.query_selector("[data-test-id='main-feed-activity-card__commentary']")
             )
-
             raw_text = text_el.inner_text().strip() if text_el else ""
             if not raw_text:
                 continue
 
-            # Date
             time_el  = el.query_selector("time")
-
-            # Image
             image_el = (
                 el.query_selector(".feed-shared-image__image")
                 or el.query_selector(".update-components-image__image")
                 or el.query_selector("img.ivm-view-attr__img--centered")
             )
-
-            # Post link
             link_el = (
                 el.query_selector("a[href*='/feed/update/']")
                 or el.query_selector("a.app-aware-link[href*='activity']")
@@ -255,10 +300,12 @@ def extract_posts(page) -> list[dict]:
 def scrape() -> None:
     if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD or not LINKEDIN_PROFILE_URL:
         raise ValueError(
-            "Missing env vars. Set LINKEDIN_EMAIL, LINKEDIN_PASSWORD, LINKEDIN_PROFILE_URL."
+            "Missing env vars. Set LINKEDIN_EMAIL, LINKEDIN_PASSWORD, "
+            "LINKEDIN_PROFILE_URL in GitHub Secrets."
         )
 
     print("🚀 Starting LinkedIn scraper …")
+    print(f"   Target profile: {LINKEDIN_PROFILE_URL}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -269,8 +316,8 @@ def scrape() -> None:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--disable-extensions",
+                "--disable-dev-shm-usage",
                 "--window-size=1366,768",
-                "--start-maximized",
             ],
         )
 
@@ -284,33 +331,29 @@ def scrape() -> None:
             locale="en-US",
             timezone_id="America/New_York",
             java_script_enabled=True,
-            accept_downloads=False,
         )
-
-        # Set a longer default timeout on the context level
         context.set_default_timeout(DEFAULT_TIMEOUT)
 
         page = context.new_page()
-
-        # Apply stealth patches
         stealth_sync(page)
 
         try:
-            # ── LOGIN ──────────────────────────────────────────────────────────
+            # ── STEP 1: Login ──────────────────────────────────────────────────
             do_login(page)
 
-            # ── NAVIGATE TO CLIENT PROFILE ─────────────────────────────────────
-            print(f"   Navigating to: {LINKEDIN_PROFILE_URL}")
+            # ── STEP 2: Navigate to client profile ────────────────────────────
+            print(f"\n   Navigating to: {LINKEDIN_PROFILE_URL}")
             page.goto(LINKEDIN_PROFILE_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
             human_delay(4, 7)
+            print_page_info(page, "profile")
+            save_debug_screenshot(page, "03_profile_page")
 
-            save_debug_screenshot(page, "profile_page_loaded")
-
-            # ── SCROLL TO LOAD POSTS ───────────────────────────────────────────
+            # ── STEP 3: Scroll to load posts ───────────────────────────────────
             print("   Scrolling to load posts …")
             scroll_slowly(page, steps=5)
+            save_debug_screenshot(page, "03b_after_scroll")
 
-            # ── EXTRACT ────────────────────────────────────────────────────────
+            # ── STEP 4: Extract posts ──────────────────────────────────────────
             print("   Extracting posts …")
             posts = extract_posts(page)
 
@@ -331,10 +374,9 @@ def scrape() -> None:
     with open("posts.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ Done! Scraped {len(posts)} posts → posts.json")
-
+    print(f"\n✅ Done! Scraped {len(posts)} posts → posts.json")
     if len(posts) == 0:
-        print("⚠️  WARNING: 0 posts scraped. Check the debug screenshots uploaded as artifacts.")
+        print("⚠️  0 posts scraped — check screenshots in debug-screenshots artifact.")
 
 
 if __name__ == "__main__":
