@@ -39,12 +39,14 @@ jobs:
           GITHUB_REPOSITORY:    ${{ github.repository }}   # auto-provided
         run: python scraper.py
 
-      - name: 📸 Upload debug screenshots
+      - name: 📸 Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: "*.png"
+          path: |
+            *.png
+            page_body_snippet.txt
           if-no-files-found: ignore
           retention-days: 3
 
