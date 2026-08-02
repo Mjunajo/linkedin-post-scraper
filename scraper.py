@@ -210,108 +210,33 @@ class NetworkPostTracker:
 
 
 # ═══════════════════════════════════════════════════════════════
-# NATURAL SEARCH & UI NAVIGATION
+# NAVIGATION TO ACTIVITY PAGE
 # ═══════════════════════════════════════════════════════════════
 
-def navigate_via_search_or_click(page, username: str) -> None:
+def navigate_to_activity_feed(page, username: str) -> None:
     """
-    Navigate to client's profile naturally through UI interaction:
-    1. Try search bar typing on LinkedIn header
-    2. Fallback to direct client-side search results page
-    3. Click profile link to load profile & activity feed
-    This avoids server-side navigation blocks & SPA redirect loops.
+    Navigate directly to recent-activity/all/ URL.
+    Blocking ServiceWorkers in browser context eliminates the SPA redirect loop.
     """
-    print(f"   Navigating to profile for: {username} ...")
+    activity_url = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
+    print(f"   Navigating directly to activity page: {activity_url}")
 
-    # Strategy 1: Use LinkedIn search bar if available
     try:
-        search_box = page.locator("input.search-global-typeahead__input, input[placeholder*='Search']").first
-        if search_box.is_visible(timeout=5_000):
-            print("   🔍 Typing username into LinkedIn search bar ...")
-            search_box.click()
-            search_box.fill(username)
-            human_delay(1, 2)
-            search_box.press("Enter")
-            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            human_delay(3, 5)
-            save_debug_screenshot(page, "02_search_results")
+        page.goto(activity_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+        human_delay(4, 6)
+        print_page_info(page, "activity-page")
+        save_debug_screenshot(page, "02_activity_page")
     except Exception as e:
-        print(f"   ⚠️ Search bar interaction notice: {e}")
+        print(f"   ⚠️ Navigation notice: {e}")
+        save_debug_screenshot(page, "02_activity_err")
 
-    # Strategy 2: Direct Search URL (bypasses profile redirect guard)
-    if username not in page.url:
-        search_url = f"https://www.linkedin.com/search/results/all/?keywords={username}"
-        print(f"   Loading search URL: {search_url}")
-        try:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            human_delay(3, 5)
-            save_debug_screenshot(page, "02_search_page")
-        except Exception as e:
-            print(f"   ⚠️ Search URL load notice: {e}")
-
-    # Strategy 3: Click profile result link
-    profile_clicked = False
-    selectors = [
-        f"a[href*='/in/{username}']",
-        "a.app-aware-link[href*='/in/']",
-        ".entity-result__title-text a",
-        ".reusable-search__result-container a",
-    ]
-    for sel in selectors:
-        try:
-            link = page.locator(sel).first
-            if link.is_visible(timeout=4_000):
-                href = link.get_attribute("href") or ""
-                print(f"   ✅ Found profile link ({sel}) → {href}")
-                link.click()
-                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-                human_delay(4, 6)
-                save_debug_screenshot(page, "02b_profile_page")
-                profile_clicked = True
-                break
-        except Exception:
-            continue
-
-    if not profile_clicked:
-        print("   ⚠️ Could not click profile link from search — attempting direct profile SPA load")
-        try:
-            page.evaluate(f"window.location.href = 'https://www.linkedin.com/in/{username}/'")
-            page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-            human_delay(4, 6)
-            save_debug_screenshot(page, "02b_profile_spa")
-        except Exception as e:
-            print(f"   ⚠️ Profile load notice: {e}")
-
-    # Scroll down to trigger Activity section & network calls
-    print("   Scrolling page to trigger Activity feed network calls ...")
-    for i in range(6):
+    # Scroll page to trigger lazy loading of posts
+    print("   Scrolling activity feed ...")
+    for i in range(7):
         page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
-        human_delay(1.5, 3.0)
+        human_delay(2.0, 3.5)
 
-    # Click 'Show all posts' / 'See all activity' if visible
-    activity_links = [
-        "a[href*='recent-activity']:has-text('Show all')",
-        "a[href*='recent-activity']:has-text('See all')",
-        "a[href*='recent-activity/all']",
-        ".pv-recent-activity-section a",
-        "button:has-text('Show all posts')",
-    ]
-    for sel in activity_links:
-        try:
-            act_link = page.locator(sel).first
-            if act_link.is_visible(timeout=3_000):
-                print(f"   ✅ Clicking activity link: {sel}")
-                act_link.click()
-                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-                human_delay(3, 5)
-                # Scroll activity page
-                for _ in range(5):
-                    page.evaluate("window.scrollBy(0, window.innerHeight * 0.75)")
-                    human_delay(1.5, 2.5)
-                save_debug_screenshot(page, "03_activity_page")
-                break
-        except Exception:
-            continue
+    save_debug_screenshot(page, "03_after_scroll")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -328,6 +253,8 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
         ".pvs-list__item--line-separated",
         ".artdeco-list__item",
         "li.artdeco-list__item",
+        ".update-components-text",
+        ".entity-result",
     ]
 
     post_elements = []
@@ -348,6 +275,7 @@ def extract_posts_from_dom(page, username: str) -> list[dict]:
                 or el.query_selector(".feed-shared-text")
                 or el.query_selector(".break-words")
                 or el.query_selector(".update-components-text")
+                or el.query_selector("[data-test-id='main-feed-activity-card__commentary']")
             )
             raw_text = text_el.inner_text().strip() if text_el else ""
             if not raw_text or len(raw_text) < 15:
@@ -392,7 +320,7 @@ def scrape() -> None:
     if not username:
         raise ValueError(f"Cannot extract username from: {LINKEDIN_PROFILE_URL}")
 
-    print("🚀 Starting LinkedIn scraper (Custom Playwright + Interceptor) …")
+    print("🚀 Starting LinkedIn scraper (Direct Activity + Interceptor) …")
     print(f"   Target Username: {username}")
 
     with sync_playwright() as p:
@@ -409,6 +337,7 @@ def scrape() -> None:
             ],
         )
 
+        # service_workers="block" prevents ServiceWorker client-side redirect loops
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -419,6 +348,7 @@ def scrape() -> None:
             locale="en-US",
             timezone_id="America/New_York",
             java_script_enabled=True,
+            service_workers="block",
         )
         context.set_default_timeout(DEFAULT_TIMEOUT)
 
@@ -435,8 +365,8 @@ def scrape() -> None:
             # Step 1: Login check & session warmup
             verify_and_warmup_session(page)
 
-            # Step 2: Search & UI Navigation
-            navigate_via_search_or_click(page, username)
+            # Step 2: Navigate directly to activity feed (with SW blocked)
+            navigate_to_activity_feed(page, username)
 
             # Step 3: Check captured posts from network response interceptor
             print(f"\n   Checking Network Interceptor results: {len(tracker.captured_posts)} posts captured")
