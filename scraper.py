@@ -137,7 +137,9 @@ def inject_session_cookie(context) -> None:
             "httpOnly": True,
             "secure":   True,
             "sameSite": "None",
-        }
+        },
+        # JSESSIONID is also checked by LinkedIn on some requests
+        # Leave blank — LinkedIn will issue one once the session is accepted
     ])
     print("   ✅ Session cookie injected (no login form, no CAPTCHA)")
 
@@ -194,28 +196,64 @@ def navigate_to_profile(page, username: str) -> None:
 
 
 def verify_session(page) -> None:
-    """Verify the injected session is still valid."""
+    """
+    Verify the injected session is still valid.
+    Uses the homepage (not /feed/) to avoid redirect loops when cookie is invalid.
+    /feed/ causes ERR_TOO_MANY_REDIRECTS with a bad cookie because LinkedIn
+    tries: feed → login → feed → login → … infinitely.
+    The homepage always returns 200 and shows either the feed or the login page.
+    """
     print("   Verifying session …")
-    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    try:
+        page.goto(
+            "https://www.linkedin.com/",
+            wait_until="domcontentloaded",
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except Exception as e:
+        err = str(e)
+        if "ERR_TOO_MANY_REDIRECTS" in err:
+            raise RuntimeError(
+                "❌ LinkedIn session cookie is INVALID or REVOKED.\n\n"
+                "LinkedIn has invalidated this cookie (common after detecting automated access).\n"
+                "You need a fresh cookie — it takes 2 minutes:\n"
+                "  1. Open Chrome → go to linkedin.com → make sure you are logged in\n"
+                "  2. Press F12 → Application tab → Cookies → linkedin.com\n"
+                "  3. Find 'li_at' → copy its Value (long string starting with AQED...)\n"
+                "  4. GitHub repo → Settings → Secrets → Actions\n"
+                "  5. Update LINKEDIN_LI_AT with the new value\n"
+                "  6. Re-run the GitHub Action\n"
+            ) from None
+        raise
+
     human_delay(3, 5)
     print_page_info(page, "session-check")
     save_debug_screenshot(page, "01_session_check")
 
     url = page.url
+    title = page.title().lower()
+
+    # Logged-in indicators
+    if any(x in url for x in ("feed", "mynetwork", "/in/")) or "linkedin" in title:
+        if "login" not in url and "signup" not in url and "authwall" not in url:
+            print("   ✅ Session valid — logged in!")
+            return
+
+    # Not logged in
     if "login" in url or "authwall" in url or "signup" in url:
         raise RuntimeError(
-            "❌ LinkedIn session cookie has expired.\n\n"
-            "To get a fresh cookie (takes ~2 minutes):\n"
-            "  1. Open Chrome → linkedin.com → log in\n"
-            "  2. Press F12 → Application tab → Cookies → linkedin.com\n"
-            "  3. Find 'li_at' → copy its Value\n"
-            "  4. Go to GitHub repo → Settings → Secrets → Actions\n"
-            "  5. Update LINKEDIN_LI_AT with the new value\n\n"
-            "Note: With 'Keep me signed in' checked, the cookie typically "
-            "lasts 12+ months. The scraper also auto-refreshes it daily via GH_PAT."
+            "❌ LinkedIn session cookie has EXPIRED.\n\n"
+            "Get a fresh cookie (2 minutes):\n"
+            "  1. Open Chrome → linkedin.com → log in with 'Keep me signed in' ✅\n"
+            "  2. Press F12 → Application → Cookies → linkedin.com\n"
+            "  3. Copy the Value of 'li_at'\n"
+            "  4. Update LINKEDIN_LI_AT in GitHub Secrets\n"
+            "  5. Re-run the workflow\n"
+            "Note: With 'Keep me signed in', cookies last 12+ months."
         )
 
-    print("   ✅ Session valid — logged in!")
+    # Unknown state — log it and continue
+    print(f"   ⚠️  Unexpected URL after homepage load: {url} — continuing anyway")
 
 
 # ═══════════════════════════════════════════════════════════════
