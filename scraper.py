@@ -153,51 +153,77 @@ async (username) => {
     };
 
     const log = [];
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // Fetch with automatic retry on 429
+    const fetchWithRetry = async (url, opts, maxRetries = 3) => {
+        for (let i = 0; i < maxRetries; i++) {
+            const resp = await fetch(url, opts);
+            log.push(`  Attempt ${i+1}: ${url.split('?')[0]} → ${resp.status}`);
+            if (resp.status === 429) {
+                const wait = (i + 1) * 20000;  // 20s, 40s, 60s
+                log.push(`  Rate-limited (429). Waiting ${wait/1000}s before retry…`);
+                await sleep(wait);
+                continue;
+            }
+            return resp;
+        }
+        return null;
+    };
 
     try {
         // ── Step 1: Resolve vanity name → entity URN ─────────────────────
-        const profileUrl = `/voyager/api/identity/profiles/${username}?projection=(id,entityUrn,miniProfile)`;
-        const profResp = await fetch(profileUrl, { headers, credentials: 'include' });
-        log.push(`Profile fetch: ${profResp.status}`);
+        log.push('Fetching profile URN…');
+        const profResp = await fetchWithRetry(
+            `/voyager/api/identity/profiles/${username}?projection=(id,entityUrn)`,
+            { headers, credentials: 'include' }
+        );
 
-        if (!profResp.ok) {
-            const text = await profResp.text();
-            return { error: 'profile_fetch_failed', status: profResp.status, log, body: text.substring(0, 500) };
+        if (!profResp || !profResp.ok) {
+            const status = profResp ? profResp.status : 'null';
+            const body   = profResp ? await profResp.text() : '';
+            return { error: 'profile_fetch_failed', status, log, body: body.substring(0, 500) };
         }
 
         const profData = await profResp.json();
-        log.push(`Profile data keys: ${Object.keys(profData).join(', ')}`);
-
-        // LinkedIn normalizes responses — entityUrn is at profData.data.entityUrn
         const entityUrn = (profData.data && profData.data.entityUrn)
             || profData.entityUrn
             || '';
-
         log.push(`Entity URN: ${entityUrn}`);
 
         if (!entityUrn) {
-            return {
-                error: 'no_entity_urn',
-                log,
-                sampleData: JSON.stringify(profData).substring(0, 1000)
-            };
+            return { error: 'no_entity_urn', log, sampleData: JSON.stringify(profData).substring(0, 1000) };
         }
 
-        // ── Step 2: Fetch recent activity posts ──────────────────────────
-        const encodedUrn = encodeURIComponent(entityUrn);
-        const postsUrl = `/voyager/api/feed/updates?profileId=${encodedUrn}&count=15&moduleKey=memberFeedModule&includeLongTermHistory=true`;
-        const postsResp = await fetch(postsUrl, { headers, credentials: 'include' });
-        log.push(`Posts fetch: ${postsResp.status}`);
+        // ── Step 2: Fetch recent posts ────────────────────────────────────
+        await sleep(5000);  // 5s gap between calls to avoid rate limiting
 
-        if (!postsResp.ok) {
-            const text = await postsResp.text();
-            return { error: 'posts_fetch_failed', status: postsResp.status, log, body: text.substring(0, 500) };
+        log.push('Fetching posts…');
+        const encodedUrn = encodeURIComponent(entityUrn);
+
+        // Primary endpoint
+        let postsResp = await fetchWithRetry(
+            `/voyager/api/feed/updates?profileId=${encodedUrn}&count=15&moduleKey=memberFeedModule&includeLongTermHistory=true`,
+            { headers, credentials: 'include' }
+        );
+
+        // Fallback endpoint if primary fails
+        if (!postsResp || !postsResp.ok) {
+            log.push('Primary posts endpoint failed — trying fallback…');
+            await sleep(10000);
+            postsResp = await fetchWithRetry(
+                `/voyager/api/feed/updates?profileId=${encodedUrn}&count=10`,
+                { headers, credentials: 'include' }
+            );
+        }
+
+        if (!postsResp || !postsResp.ok) {
+            const status = postsResp ? postsResp.status : 'null';
+            return { error: 'posts_fetch_failed', status, log };
         }
 
         const postsData = await postsResp.json();
-        log.push(`Posts response keys: ${Object.keys(postsData).join(', ')}`);
         log.push(`Included items: ${(postsData.included || []).length}`);
-        log.push(`Elements: ${(postsData.data && postsData.data.elements ? postsData.data.elements.length : 0)}`);
 
         return { success: true, entityUrn, log, data: postsData };
 
@@ -210,8 +236,13 @@ async (username) => {
 
 def call_voyager_api(page, username):
     """Call LinkedIn's Voyager API from within the authenticated feed page."""
+    # Wait before calling the API so LinkedIn doesn't rate-limit the session.
+    # A fresh session hitting the API immediately often gets a 429.
+    print("   Waiting 15s before API call (rate-limit warm-up) …")
+    time.sleep(15)
     print(f"   Calling Voyager API for: {username}")
-    result = page.evaluate(VOYAGER_JS, username)
+    # Use a long timeout — the JS retries can wait up to 2 minutes total.
+    result = page.evaluate(VOYAGER_JS, username, timeout=300_000)
     return result
 
 
@@ -339,6 +370,8 @@ def scrape():
 
         page = context.new_page()
         stealth_sync(page)
+        # Give the Voyager API JS up to 5 minutes (retries can take 60s+ each)
+        page.set_default_timeout(300_000)
 
         posts = []
         try:
