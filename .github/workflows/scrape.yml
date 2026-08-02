@@ -1,42 +1,41 @@
 name: LinkedIn Post Scraper
 
 on:
-  # Runs every day at 7:00 AM UTC
   schedule:
-    - cron: '0 7 * * *'
-  # Allow manual trigger from the GitHub Actions tab
-  workflow_dispatch:
+    - cron: '0 7 * * *'   # Daily at 7:00 AM UTC
+  workflow_dispatch:        # Manual trigger from Actions tab
 
 permissions:
   contents: write
 
 jobs:
   scrape-linkedin:
-    # ─── FIX: Pin to Ubuntu 22.04 ────────────────────────────────────────────
-    # ubuntu-latest is now 24.04 (Noble) which renamed libasound2 → libasound2t64
-    # Playwright's install-deps still expects the old name, so we use 22.04 (Jammy)
-    # which has full Playwright support and the correct package names.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04   # Pinned — 24.04 breaks Playwright's libasound2 dep
     timeout-minutes: 15
 
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python
+      # ── 2. Python ─────────────────────────────────────────────────────────
+      - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
+      # ── 3. Python packages ─────────────────────────────────────────────────
       - name: 📦 Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: 🌐 Install Playwright browser + dependencies
+      # ── 4. Playwright browser ──────────────────────────────────────────────
+      - name: 🌐 Install Playwright + Chromium
         run: |
           playwright install chromium
           playwright install-deps chromium
 
+      # ── 5. Run scraper ─────────────────────────────────────────────────────
       - name: 🔍 Run LinkedIn scraper
         env:
           LINKEDIN_EMAIL:       ${{ secrets.LINKEDIN_EMAIL }}
@@ -44,6 +43,19 @@ jobs:
           LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
         run: python scraper.py
 
+      # ── 6. Upload debug screenshots (always, even on failure) ──────────────
+      #    If the scraper fails you can download these from the Actions run page
+      #    to see exactly what the browser was looking at.
+      - name: 📸 Upload debug screenshots
+        if: always()   # Run this step even if scraper failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore   # Don't fail if no screenshots exist
+          retention-days: 3           # Auto-delete after 3 days
+
+      # ── 7. Commit updated posts.json ───────────────────────────────────────
       - name: 💾 Commit updated posts.json
         run: |
           git config user.name  "github-actions[bot]"
