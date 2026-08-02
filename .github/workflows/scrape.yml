@@ -36,7 +36,7 @@ jobs:
           LINKEDIN_LI_AT:       ${{ secrets.LINKEDIN_LI_AT }}
           LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
           GH_PAT:               ${{ secrets.GH_PAT }}
-          GITHUB_REPOSITORY:    ${{ github.repository }}   # auto-provided
+          GITHUB_REPOSITORY:    ${{ github.repository }}
         run: python scraper.py
 
       - name: 📸 Upload debug artifacts
