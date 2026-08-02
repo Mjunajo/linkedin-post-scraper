@@ -242,7 +242,7 @@ def call_voyager_api(page, username):
     time.sleep(15)
     print(f"   Calling Voyager API for: {username}")
     # Use a long timeout — the JS retries can wait up to 2 minutes total.
-    result = page.evaluate(VOYAGER_JS, username, timeout=300_000)
+    result = page.evaluate(VOYAGER_JS, username)
     return result
 
 
