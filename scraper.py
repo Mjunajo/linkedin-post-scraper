@@ -157,14 +157,13 @@ def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
     # ── END DIAGNOSTIC ─────────────────────────────────────────────────────
 
 
-    for raw_block in code_blocks:
+    for idx, raw_block in enumerate(code_blocks):
         cleaned = raw_block.strip()
 
-        # Remove HTML comment wrappers if present <!-- ... -->
+        # Strip HTML comment wrappers <!-- ... -->
         if cleaned.startswith("<!--") and cleaned.endswith("-->"):
             cleaned = cleaned[4:-3].strip()
 
-        # Unescape HTML entities like &quot;, &amp;
         cleaned = html.unescape(cleaned)
 
         if not (cleaned.startswith("{") or cleaned.startswith("[")):
@@ -175,13 +174,42 @@ def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
         except Exception:
             continue
 
-        # Extract items from JSON structure
+        # Build the list of items to inspect for post content.
+        # LinkedIn's code blocks use several formats:
+        #   1. Voyager REST:  {"data": {...}, "included": [...]}
+        #   2. Collection:    {"data": {"elements": [...], ...}}
+        #   3. GraphQL:       {"data": {"data": {"identityDash...": {...}}}}
         items = []
+
         if isinstance(data, dict):
+            top_data = data.get("data", {})
+
+            # Format 1: top-level included array
             if "included" in data and isinstance(data["included"], list):
                 items.extend(data["included"])
-            if "data" in data and isinstance(data["data"], dict):
-                items.append(data["data"])
+
+            # Format 2: data.elements array (Block 00 — the activity collection)
+            if isinstance(top_data, dict) and "elements" in top_data:
+                elems = top_data["elements"]
+                if isinstance(elems, list):
+                    items.extend(elems)
+
+            # Format 3: data.data (GraphQL double-wrapper, Blocks 14 & 16)
+            if isinstance(top_data, dict) and "data" in top_data:
+                inner = top_data["data"]
+                if isinstance(inner, dict):
+                    items.append(inner)
+                    # Recursively extract any nested elements/included
+                    for v in inner.values():
+                        if isinstance(v, dict) and "elements" in v:
+                            items.extend(v["elements"])
+                        if isinstance(v, list):
+                            items.extend(v)
+
+            # Also treat top_data itself as an item
+            if isinstance(top_data, dict):
+                items.append(top_data)
+
         elif isinstance(data, list):
             items.extend(data)
 
@@ -190,18 +218,31 @@ def parse_linkedin_html_payload(html_content: str, username: str) -> list[dict]:
                 continue
 
             text = _extract_text_from_item(item)
-            if not text or len(text) < 15 or text in seen_texts:
+
+            # Deeper search: look inside nested value/content dicts
+            if not text:
+                for nested_key in ("value", "actor", "content", "updateMetadata"):
+                    nested = item.get(nested_key)
+                    if isinstance(nested, dict):
+                        text = _extract_text_from_item(nested)
+                        if text:
+                            break
+
+            if not text or len(text) < 20 or text in seen_texts:
                 continue
 
-            # Skip header bio / employment summary strings
-            if any(text.startswith(prefix) for prefix in ("Web Developer at", "Experience", "Education", "Contact info")):
+            # Skip non-post strings
+            skip_prefixes = (
+                "Web Developer", "Experience", "Education", "Contact info",
+                "urn:", "com.linkedin", "http", "AQ", "AAZ",
+            )
+            if any(text.startswith(p) for p in skip_prefixes):
                 continue
 
             seen_texts.add(text)
-
-            date = _extract_date_from_item(item)
+            date      = _extract_date_from_item(item)
             image_url = _extract_image_from_item(item)
-            post_url = _extract_post_url_from_item(item, username)
+            post_url  = _extract_post_url_from_item(item, username)
 
             posts.append({
                 "text":      text,
