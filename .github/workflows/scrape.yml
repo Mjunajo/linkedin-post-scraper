@@ -1,49 +1,42 @@
 name: LinkedIn Post Scraper
 
-# ─── TRIGGERS ─────────────────────────────────────────────────────────────────
 on:
-  # Runs every day at 7:00 AM UTC (adjust to your client's timezone)
-  # UTC 7AM = 12PM Pakistan / 3AM EST / 8AM UK
+  # Runs every day at 7:00 AM UTC
   schedule:
     - cron: '0 7 * * *'
-
-  # Lets you trigger it manually from the GitHub Actions tab anytime
+  # Allow manual trigger from the GitHub Actions tab
   workflow_dispatch:
 
-# ─── PERMISSIONS ──────────────────────────────────────────────────────────────
-# Required so the workflow can commit posts.json back to the repo
 permissions:
   contents: write
 
-# ─── JOB ──────────────────────────────────────────────────────────────────────
 jobs:
   scrape-linkedin:
-    runs-on: ubuntu-latest
+    # ─── FIX: Pin to Ubuntu 22.04 ────────────────────────────────────────────
+    # ubuntu-latest is now 24.04 (Noble) which renamed libasound2 → libasound2t64
+    # Playwright's install-deps still expects the old name, so we use 22.04 (Jammy)
+    # which has full Playwright support and the correct package names.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     steps:
-      # 1. Check out the repo so we can edit files
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Set up Python 3.11
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. Install Python packages from requirements.txt
       - name: 📦 Install Python dependencies
         run: pip install -r requirements.txt
 
-      # 4. Install the Chromium browser used by Playwright
-      - name: 🌐 Install Playwright browsers
+      - name: 🌐 Install Playwright browser + dependencies
         run: |
           playwright install chromium
           playwright install-deps chromium
 
-      # 5. Run the scraper — credentials come from GitHub Secrets (never visible in logs)
       - name: 🔍 Run LinkedIn scraper
         env:
           LINKEDIN_EMAIL:       ${{ secrets.LINKEDIN_EMAIL }}
@@ -51,13 +44,11 @@ jobs:
           LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
         run: python scraper.py
 
-      # 6. Commit the updated posts.json back to the repo
       - name: 💾 Commit updated posts.json
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add posts.json
-          # Only commit if posts.json actually changed
           git diff --staged --quiet && echo "No changes to commit" || \
             git commit -m "chore: update LinkedIn posts [$(date -u '+%Y-%m-%d %H:%M UTC')]"
           git push
