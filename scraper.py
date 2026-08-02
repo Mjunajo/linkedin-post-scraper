@@ -291,54 +291,96 @@ def voyager_api_headers(csrf: str, referer: str) -> dict:
 
 def fetch_posts_via_api(session: requests.Session, username: str, csrf: str) -> list[dict]:
     """
-    Call Voyager API endpoints directly.
-    Tries two endpoints: profileUpdatesV2 (REST) and the GraphQL activity query.
+    Try multiple Voyager API endpoint + parameter combinations.
+    Logs response body on every non-200 so we can diagnose issues.
     """
-    referer = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
-    hdrs    = voyager_api_headers(csrf, referer)
+    base_feed = "https://www.linkedin.com/voyager/api/feed/updatesV2"
+    base_prof = "https://www.linkedin.com/voyager/api/identity"
+    referer   = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
+    hdrs      = voyager_api_headers(csrf, referer)
 
-    # ── Endpoint 1: profileUpdatesV2 (classic REST) ──────────────────────
-    url1    = "https://www.linkedin.com/voyager/api/identity/profileUpdatesV2"
-    params1 = {"memberIdentity": username, "count": 6, "start": 0, "includeLongTermHistory": "true"}
-    print(f"\n   Calling Voyager REST: {url1}")
+    def call(label: str, url: str, params: dict) -> list[dict]:
+        try:
+            r = session.get(url, headers=hdrs, params=params, timeout=30)
+            print(f"\n   [{label}] {r.status_code}  {r.url[:90]}")
+            if r.status_code != 200:
+                # Print first 500 chars of error body for diagnostics
+                print(f"   Response body: {r.text[:500]}")
+                return []
+            data = r.json()
+            with open(f"api_{label.replace(' ', '_')}.json", "w") as f:
+                f.write(r.text[:60_000])
+            return parse_voyager_response(data, username)
+        except Exception as e:
+            print(f"   [{label}] Error: {e}")
+            return []
+
+    # ── 1. profileUpdatesV2  q=memberIdentity (correct Voyager query type) ───
+    posts = call("profileUpdatesV2", f"{base_prof}/profileUpdatesV2", {
+        "q":              "memberIdentity",
+        "memberIdentity": username,
+        "count":          "6",
+        "start":          "0",
+    })
+    if posts:
+        return posts
+
+    # ── 2. feed/updatesV2  q=memberIdentity ──────────────────────────────────
+    posts = call("feed_updatesV2_identity", base_feed, {
+        "q":              "memberIdentity",
+        "memberIdentity": username,
+        "count":          "6",
+        "type":           "MEMBER",
+        "start":          "0",
+    })
+    if posts:
+        return posts
+
+    # ── 3. Get profile URN first, then feed/updatesV2 with profileId ─────────
+    print(f"\n   [profile lookup] fetching URN for {username} …")
     try:
-        r = session.get(url1, headers=hdrs, params=params1, timeout=30)
-        print(f"   Status: {r.status_code}")
-        with open("voyager_response.json", "w") as f:
-            f.write(r.text[:50_000])
+        pr = session.get(
+            f"{base_prof}/profiles/{username}",
+            headers=hdrs,
+            timeout=30,
+        )
+        print(f"   [profile lookup] {pr.status_code}")
+        if pr.status_code == 200:
+            profile_urn = pr.json().get("data", {}).get("entityUrn", "")
+            print(f"   Profile URN: {profile_urn}")
+            if profile_urn:
+                # 3a. feed/updatesV2 with profileId URN
+                posts = call("feed_updatesV2_profileId", base_feed, {
+                    "profileId": profile_urn,
+                    "type":      "MEMBER",
+                    "count":     "6",
+                    "start":     "0",
+                })
+                if posts:
+                    return posts
 
-        if r.status_code == 200:
-            posts = parse_voyager_response(r.json(), username)
-            if posts:
-                return posts
-        elif r.status_code == 429:
-            print("   ⚠️ 429 Rate-limited — account needs more trust (see note below)")
+                # 3b. profileUpdatesV2 with profileId URN
+                posts = call("profileUpdatesV2_profileId", f"{base_prof}/profileUpdatesV2", {
+                    "q":         "memberProfileId",
+                    "profileId": profile_urn,
+                    "count":     "6",
+                    "start":     "0",
+                })
+                if posts:
+                    return posts
         else:
-            print(f"   ⚠️ Unexpected status {r.status_code}")
+            print(f"   Profile lookup body: {pr.text[:500]}")
     except Exception as e:
-        print(f"   ⚠️ REST API error: {e}")
+        print(f"   Profile lookup error: {e}")
 
-    # ── Endpoint 2: GraphQL activity ──────────────────────────────────────
-    url2 = (
-        "https://www.linkedin.com/voyager/api/graphql"
-        "?variables=(profileIdentity:(vanityName:" + username + "),count:6,start:0)"
-        "&queryId=voyagerIdentityDashProfileUpdates.4a16ce71b8b9c0bfbf35abe10f75e8f8"
-    )
-    print(f"\n   Calling Voyager GraphQL: {url2[:90]}…")
-    try:
-        r2 = session.get(url2, headers={**hdrs, "Accept": "application/json"}, timeout=30)
-        print(f"   Status: {r2.status_code}")
-        with open("voyager_graphql_response.json", "w") as f:
-            f.write(r2.text[:50_000])
-
-        if r2.status_code == 200:
-            posts = parse_voyager_response(r2.json(), username)
-            if posts:
-                return posts
-        elif r2.status_code == 429:
-            print("   ⚠️ 429 Rate-limited on GraphQL too")
-    except Exception as e:
-        print(f"   ⚠️ GraphQL API error: {e}")
+    # ── 4. Dash API (newer endpoint) ─────────────────────────────────────────
+    posts = call("dash_profileUpdates", "https://www.linkedin.com/voyager/api/identity/dash/profileUpdates", {
+        "q":              "memberIdentity",
+        "memberIdentity": f"urn:li:member:{username}",
+        "count":          "6",
+    })
+    if posts:
+        return posts
 
     return []
 
