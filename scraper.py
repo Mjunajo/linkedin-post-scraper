@@ -11,19 +11,22 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_sync
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
+# Use a THROWAWAY LinkedIn account's li_at cookie here — NOT your real account.
+# The throwaway account should never be opened in a browser while the scraper runs.
+# Get cookie: Chrome → F12 → Application → Cookies → linkedin.com → li_at
 LI_AT_COOKIE         = os.environ.get("LINKEDIN_LI_AT", "")
 LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
 
-# For auto-refresh: a GitHub Personal Access Token with repo scope
+# GitHub PAT for auto-refreshing the cookie secret after each run
 GH_PAT            = os.environ.get("GH_PAT", "")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # auto-set by GitHub Actions
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TIMEOUT = 60_000  # ms
 
 
 # ═══════════════════════════════════════════════════════════════
-# HELPERS
+# UTILITIES
 # ═══════════════════════════════════════════════════════════════
 
 def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
@@ -52,15 +55,19 @@ def print_page_info(page, label: str = "") -> None:
         pass
 
 
+def extract_username_from_url(url: str) -> str:
+    """Extract LinkedIn username from any profile URL format."""
+    match = re.search(r'linkedin\.com/in/([^/?#]+)', url)
+    if match:
+        return match.group(1).strip('/')
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════
 # GITHUB SECRET AUTO-REFRESH
 # ═══════════════════════════════════════════════════════════════
 
 def _encrypt_secret_for_github(public_key_b64: str, secret_value: str) -> str:
-    """
-    Encrypt a secret value using the repo's public key.
-    Required by GitHub API before updating a secret.
-    """
     pk = nacl_public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
     sealed_box = nacl_public.SealedBox(pk)
     encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
@@ -68,32 +75,25 @@ def _encrypt_secret_for_github(public_key_b64: str, secret_value: str) -> str:
 
 
 def refresh_github_secret(secret_name: str, new_value: str) -> bool:
-    """
-    Update a GitHub Actions secret via the GitHub API.
-    Requires GH_PAT (Personal Access Token) with repo scope.
-    Returns True on success, False on failure.
-    """
     if not GH_PAT or not GITHUB_REPOSITORY:
-        print("   ⚠️  GH_PAT or GITHUB_REPOSITORY not set — skipping auto-refresh")
+        print("   ⚠️  GH_PAT not set — skipping auto-refresh of secret")
         return False
 
     headers = {
         "Authorization": f"Bearer {GH_PAT}",
-        "Accept":        "application/vnd.github+json",
+        "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     base_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets"
 
-    # Step 1: Get repo public key (needed to encrypt the secret)
     key_resp = requests.get(f"{base_url}/public-key", headers=headers, timeout=10)
     if key_resp.status_code != 200:
-        print(f"   ⚠️  Could not fetch GitHub public key: {key_resp.status_code}")
+        print(f"   ⚠️  GitHub public key fetch failed: {key_resp.status_code}")
         return False
 
     key_data      = key_resp.json()
     encrypted_val = _encrypt_secret_for_github(key_data["key"], new_value)
 
-    # Step 2: Push the updated secret
     put_resp = requests.put(
         f"{base_url}/{secret_name}",
         headers=headers,
@@ -102,19 +102,14 @@ def refresh_github_secret(secret_name: str, new_value: str) -> bool:
     )
 
     if put_resp.status_code in (201, 204):
-        print(f"   ✅ GitHub Secret '{secret_name}' updated automatically")
+        print(f"   ✅ GitHub Secret '{secret_name}' auto-refreshed")
         return True
     else:
-        print(f"   ⚠️  Secret update failed: {put_resp.status_code} — {put_resp.text}")
+        print(f"   ⚠️  Secret update failed: {put_resp.status_code}")
         return False
 
 
 def extract_fresh_li_at(context) -> str:
-    """
-    After scraping, read the current li_at cookie value from the browser.
-    LinkedIn often refreshes/extends the cookie on each use —
-    we capture the latest value and save it back to GitHub Secrets.
-    """
     cookies = context.cookies()
     for c in cookies:
         if c["name"] == "li_at" and "linkedin.com" in c.get("domain", ""):
@@ -127,7 +122,6 @@ def extract_fresh_li_at(context) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def inject_session_cookie(context) -> None:
-    """Inject li_at directly — bypasses login form and CAPTCHA entirely."""
     context.add_cookies([
         {
             "name":     "li_at",
@@ -137,92 +131,32 @@ def inject_session_cookie(context) -> None:
             "httpOnly": True,
             "secure":   True,
             "sameSite": "None",
-        },
-        # JSESSIONID is also checked by LinkedIn on some requests
-        # Leave blank — LinkedIn will issue one once the session is accepted
+        }
     ])
     print("   ✅ Session cookie injected (no login form, no CAPTCHA)")
 
 
-def extract_username_from_url(url: str) -> str:
-    """
-    Extract the LinkedIn username/slug from any LinkedIn profile URL format.
-    Handles:
-      https://www.linkedin.com/in/username/
-      https://www.linkedin.com/in/username/recent-activity/all/
-      https://www.linkedin.com/in/username/recent-activity/shares/
-    """
-    match = re.search(r'linkedin\.com/in/([^/?#]+)', url)
-    if match:
-        return match.group(1).strip('/')
-    return ""
-
-
-def build_activity_url(username: str) -> str:
-    """Build the canonical recent-activity URL for a given LinkedIn username."""
-    return f"https://www.linkedin.com/in/{username}/recent-activity/all/"
-
-
-def navigate_to_profile(page, username: str) -> None:
-    """
-    Navigate to the client's LinkedIn activity page in two steps:
-    1. Go to the base profile page first (avoids redirect loops)
-    2. Then go to the recent-activity page
-    This prevents ERR_TOO_MANY_REDIRECTS caused by stale or malformed activity URLs.
-    """
-    base_url     = f"https://www.linkedin.com/in/{username}/"
-    activity_url = build_activity_url(username)
-
-    # Step 1: base profile
-    print(f"   Step 1 — Loading base profile: {base_url}")
-    try:
-        page.goto(base_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-    except Exception as e:
-        print(f"   ⚠️  Base profile load warning (continuing): {e}")
-    human_delay(3, 5)
-    print_page_info(page, "base-profile")
-    save_debug_screenshot(page, "02a_base_profile")
-
-    # Step 2: activity page
-    print(f"   Step 2 — Loading activity page: {activity_url}")
-    try:
-        page.goto(activity_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
-    except Exception as e:
-        # Catch redirect errors — page may still have loaded partially
-        print(f"   ⚠️  Activity page warning (will try to scrape anyway): {e}")
-    human_delay(4, 6)
-    print_page_info(page, "activity-page")
-    save_debug_screenshot(page, "02b_activity_page")
-
-
 def verify_session(page) -> None:
     """
-    Verify the injected session is still valid.
-    Uses the homepage (not /feed/) to avoid redirect loops when cookie is invalid.
-    /feed/ causes ERR_TOO_MANY_REDIRECTS with a bad cookie because LinkedIn
-    tries: feed → login → feed → login → … infinitely.
-    The homepage always returns 200 and shows either the feed or the login page.
+    Verify session using the homepage to avoid redirect loops.
+    ERR_TOO_MANY_REDIRECTS on /feed/ is the signature of an invalid cookie.
     """
     print("   Verifying session …")
     try:
-        page.goto(
-            "https://www.linkedin.com/",
-            wait_until="domcontentloaded",
-            timeout=DEFAULT_TIMEOUT,
-        )
+        page.goto("https://www.linkedin.com/", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
     except Exception as e:
-        err = str(e)
-        if "ERR_TOO_MANY_REDIRECTS" in err:
+        if "ERR_TOO_MANY_REDIRECTS" in str(e):
             raise RuntimeError(
-                "❌ LinkedIn session cookie is INVALID or REVOKED.\n\n"
-                "LinkedIn has invalidated this cookie (common after detecting automated access).\n"
-                "You need a fresh cookie — it takes 2 minutes:\n"
-                "  1. Open Chrome → go to linkedin.com → make sure you are logged in\n"
-                "  2. Press F12 → Application tab → Cookies → linkedin.com\n"
-                "  3. Find 'li_at' → copy its Value (long string starting with AQED...)\n"
-                "  4. GitHub repo → Settings → Secrets → Actions\n"
-                "  5. Update LINKEDIN_LI_AT with the new value\n"
-                "  6. Re-run the GitHub Action\n"
+                "❌ LinkedIn cookie is INVALID or REVOKED.\n\n"
+                "IMPORTANT: Use a THROWAWAY LinkedIn account's cookie — not your real account.\n"
+                "If you use your real account's cookie, LinkedIn logs you out of your browser\n"
+                "when the scraper runs from a different IP.\n\n"
+                "Steps:\n"
+                "  1. Create a throwaway LinkedIn account (new Gmail → new LinkedIn)\n"
+                "  2. Log in to it in Chrome with 'Keep me signed in' ✅\n"
+                "  3. Copy li_at cookie → update LINKEDIN_LI_AT in GitHub Secrets\n"
+                "  4. Log OUT of the throwaway account in your browser\n"
+                "  5. Re-run the workflow\n"
             ) from None
         raise
 
@@ -230,60 +164,150 @@ def verify_session(page) -> None:
     print_page_info(page, "session-check")
     save_debug_screenshot(page, "01_session_check")
 
-    url = page.url
+    url   = page.url
     title = page.title().lower()
 
-    # Logged-in indicators
-    if any(x in url for x in ("feed", "mynetwork", "/in/")) or "linkedin" in title:
-        if "login" not in url and "signup" not in url and "authwall" not in url:
-            print("   ✅ Session valid — logged in!")
-            return
-
-    # Not logged in
     if "login" in url or "authwall" in url or "signup" in url:
         raise RuntimeError(
-            "❌ LinkedIn session cookie has EXPIRED.\n\n"
-            "Get a fresh cookie (2 minutes):\n"
-            "  1. Open Chrome → linkedin.com → log in with 'Keep me signed in' ✅\n"
-            "  2. Press F12 → Application → Cookies → linkedin.com\n"
-            "  3. Copy the Value of 'li_at'\n"
-            "  4. Update LINKEDIN_LI_AT in GitHub Secrets\n"
+            "❌ LinkedIn cookie has EXPIRED.\n\n"
+            "Get a fresh cookie from your throwaway LinkedIn account:\n"
+            "  1. Open Chrome → log into your throwaway LinkedIn account\n"
+            "     with 'Keep me signed in' ✅\n"
+            "  2. F12 → Application → Cookies → linkedin.com → li_at\n"
+            "  3. Copy the value → update LINKEDIN_LI_AT in GitHub Secrets\n"
+            "  4. Log OUT of the throwaway account in your browser\n"
             "  5. Re-run the workflow\n"
-            "Note: With 'Keep me signed in', cookies last 12+ months."
+            "The cookie lasts 12+ months when used from only one place."
         )
 
-    # Unknown state — log it and continue
-    print(f"   ⚠️  Unexpected URL after homepage load: {url} — continuing anyway")
+    if any(x in url for x in ("feed", "mynetwork", "/in/")) and "login" not in url:
+        print("   ✅ Session valid — logged in!")
+        return
+
+    print(f"   ⚠️  Unexpected URL: {url} — continuing anyway")
 
 
 # ═══════════════════════════════════════════════════════════════
-# SCRAPING
+# NAVIGATION
+# ═══════════════════════════════════════════════════════════════
+
+def navigate_to_profile(page, username: str) -> None:
+    """
+    Navigate to the client's LinkedIn activity page in 3 stages:
+
+    Stage 1 — Load base profile (always works)
+    Stage 2 — Click 'Show all posts' link naturally (avoids redirect loops)
+    Stage 3 — If no link found, use JS window.location (bypasses Playwright's
+               redirect counter that causes ERR_TOO_MANY_REDIRECTS on page.goto)
+    """
+    base_url     = f"https://www.linkedin.com/in/{username}/"
+    activity_url = f"https://www.linkedin.com/in/{username}/recent-activity/all/"
+
+    # ── Stage 1: Load base profile ────────────────────────────────────────────
+    print(f"   Loading base profile: {base_url}")
+    try:
+        page.goto(base_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    except Exception as e:
+        print(f"   ⚠️  Profile load warning: {e}")
+    human_delay(3, 5)
+    print_page_info(page, "base-profile")
+    save_debug_screenshot(page, "02a_base_profile")
+
+    # Scroll to trigger Activity section lazy-load
+    for _ in range(4):
+        page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
+        human_delay(1.5, 2.5)
+    save_debug_screenshot(page, "02b_profile_scrolled")
+
+    # ── Stage 2: Click 'Show all posts' link ──────────────────────────────────
+    click_selectors = [
+        "a[href*='recent-activity']:has-text('Show all')",
+        "a[href*='recent-activity']:has-text('See all')",
+        "a[href*='recent-activity/all']",
+        "a[href*='recent-activity']",
+        ".pv-recent-activity-section a",
+    ]
+
+    clicked = False
+    for sel in click_selectors:
+        try:
+            link = page.locator(sel).first
+            if link.is_visible(timeout=4_000):
+                href = link.get_attribute("href") or ""
+                print(f"   ✅ Clicking activity link → {href}")
+                link.click()
+                page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                human_delay(3, 5)
+                print_page_info(page, "after-click")
+                save_debug_screenshot(page, "02c_activity_clicked")
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if clicked:
+        return
+
+    # ── Stage 3: JS navigation (bypasses ERR_TOO_MANY_REDIRECTS) ─────────────
+    print(f"   No click link found — using JS navigation to: {activity_url}")
+    try:
+        page.evaluate(f"window.location.href = '{activity_url}'")
+        page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
+        human_delay(4, 6)
+        print_page_info(page, "after-js-nav")
+        save_debug_screenshot(page, "02c_activity_js_nav")
+    except Exception as e:
+        print(f"   ⚠️  JS navigation warning: {e} — will scrape current page")
+        page.evaluate("window.scrollTo(0, 0)")
+        human_delay(1, 2)
+
+
+# ═══════════════════════════════════════════════════════════════
+# POST EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
 def extract_posts(page) -> list[dict]:
+    """
+    Extract up to 6 posts.
+    Tries activity/feed page selectors first, then profile-page selectors.
+    """
     posts = []
 
-    post_selectors = [
+    # Activity feed page selectors
+    feed_selectors = [
         ".feed-shared-update-v2",
         ".occludable-update",
         "[data-urn*='activity']",
         ".profile-creator-shared-feed-update__container",
     ]
 
+    # Profile page Activity section selectors (fallback)
+    profile_selectors = [
+        ".pvs-list__item--line-separated",
+        ".artdeco-list__item",
+        ".pv-recent-activity-section-v2__item",
+        "li.artdeco-list__item",
+        ".pvs-entity",
+    ]
+
     post_elements = []
-    for sel in post_selectors:
-        try:
-            page.wait_for_selector(sel, timeout=15_000)
-            post_elements = page.query_selector_all(sel)
-            if post_elements:
-                print(f"   Found {len(post_elements)} post elements via: {sel}")
-                break
-        except PWTimeout:
-            print(f"   — Post selector not found: {sel}")
+    for group_name, group in [("feed", feed_selectors), ("profile", profile_selectors)]:
+        for sel in group:
+            try:
+                page.wait_for_selector(sel, timeout=10_000)
+                elements = page.query_selector_all(sel)
+                if elements:
+                    print(f"   Found {len(elements)} elements [{group_name}] via: {sel}")
+                    post_elements = elements
+                    break
+            except PWTimeout:
+                print(f"   — Not found: {sel}")
+        if post_elements:
+            break
 
     if not post_elements:
         save_debug_screenshot(page, "04_no_posts_found")
-        print("   ⚠️  No post elements found — check 04_no_posts_found.png")
+        print("   ⚠️  No post elements found — see 04_no_posts_found.png")
         return posts
 
     for el in post_elements[:14]:
@@ -336,12 +360,23 @@ def extract_posts(page) -> list[dict]:
 
 def scrape() -> None:
     if not LI_AT_COOKIE:
-        raise ValueError("LINKEDIN_LI_AT secret is not set. See setup instructions.")
+        raise ValueError(
+            "LINKEDIN_LI_AT secret is not set.\n"
+            "Create a throwaway LinkedIn account, get its li_at cookie, and add it as a GitHub Secret."
+        )
     if not LINKEDIN_PROFILE_URL:
         raise ValueError("LINKEDIN_PROFILE_URL secret is not set.")
 
-    print("🚀 Starting LinkedIn scraper (cookie auth + auto-refresh) …")
-    print(f"   Target: {LINKEDIN_PROFILE_URL}")
+    print("🚀 Starting LinkedIn scraper …")
+    print(f"   Target profile: {LINKEDIN_PROFILE_URL}")
+
+    username = extract_username_from_url(LINKEDIN_PROFILE_URL)
+    if not username:
+        raise ValueError(
+            f"Cannot extract LinkedIn username from: {LINKEDIN_PROFILE_URL}\n"
+            "Expected format: https://www.linkedin.com/in/USERNAME/"
+        )
+    print(f"   Client username: {username}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -370,7 +405,6 @@ def scrape() -> None:
         )
         context.set_default_timeout(DEFAULT_TIMEOUT)
 
-        # ── 1. Inject cookie (no login/CAPTCHA) ───────────────────────────────
         inject_session_cookie(context)
 
         page = context.new_page()
@@ -378,40 +412,31 @@ def scrape() -> None:
 
         posts = []
         try:
-            # ── 2. Verify session ─────────────────────────────────────────────
+            # 1. Verify session
             verify_session(page)
 
-            # ── 3. Navigate to client profile (two-step to avoid redirects) ───
-            username = extract_username_from_url(LINKEDIN_PROFILE_URL)
-            if not username:
-                raise ValueError(
-                    f"Could not extract LinkedIn username from LINKEDIN_PROFILE_URL.\n"
-                    f"Make sure it looks like: https://www.linkedin.com/in/USERNAME/"
-                )
-            print(f"\n   Client LinkedIn username: {username}")
+            # 2. Navigate to client's activity page
             navigate_to_profile(page, username)
 
-            # ── 4. Scroll to trigger lazy-load ────────────────────────────────
+            # 3. Scroll to load all posts
             print("   Scrolling to load posts …")
             scroll_slowly(page, steps=5)
             save_debug_screenshot(page, "03_after_scroll")
 
-            # ── 5. Extract posts ──────────────────────────────────────────────
+            # 4. Extract posts
             print("   Extracting posts …")
             posts = extract_posts(page)
 
-            # ── 6. Auto-refresh the cookie in GitHub Secrets ──────────────────
-            # After a successful scrape, LinkedIn may have issued a refreshed cookie.
-            # We capture it and push it back to GitHub so the secret never expires.
-            print("\n   Checking for refreshed session cookie …")
-            fresh_li_at = extract_fresh_li_at(context)
-            if fresh_li_at and fresh_li_at != LI_AT_COOKIE:
-                print("   🔄 Cookie was refreshed by LinkedIn — saving new value …")
-                refresh_github_secret("LINKEDIN_LI_AT", fresh_li_at)
-            elif fresh_li_at == LI_AT_COOKIE:
-                print("   ✅ Cookie unchanged — still fresh, no update needed")
+            # 5. Auto-refresh cookie in GitHub Secrets
+            print("\n   Checking for refreshed cookie …")
+            fresh = extract_fresh_li_at(context)
+            if fresh and fresh != LI_AT_COOKIE:
+                print("   🔄 Cookie refreshed by LinkedIn — saving …")
+                refresh_github_secret("LINKEDIN_LI_AT", fresh)
+            elif fresh:
+                print("   ✅ Cookie unchanged — still fresh")
             else:
-                print("   ⚠️  Could not read fresh cookie from browser")
+                print("   ⚠️  Could not read cookie from browser")
 
         except Exception as e:
             save_debug_screenshot(page, "error_state")
@@ -420,7 +445,6 @@ def scrape() -> None:
 
         browser.close()
 
-    # ── 7. Write posts.json ────────────────────────────────────────────────────
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "post_count": len(posts),
@@ -431,7 +455,7 @@ def scrape() -> None:
 
     print(f"\n✅ Done! Scraped {len(posts)} posts → posts.json")
     if len(posts) == 0:
-        print("⚠️  0 posts scraped — check debug screenshots in artifacts.")
+        print("⚠️  0 posts — check debug screenshots in artifacts.")
 
 
 if __name__ == "__main__":
