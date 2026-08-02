@@ -2,18 +2,29 @@ import json
 import time
 import random
 import os
+import base64
+import requests
+from nacl import encoding, public as nacl_public
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_sync
 
-# ─── CREDENTIALS ───────────────────────────────────────────────────────────────
-LINKEDIN_EMAIL       = os.environ.get("LINKEDIN_EMAIL", "")
-LINKEDIN_PASSWORD    = os.environ.get("LINKEDIN_PASSWORD", "")
+# ─── CONFIGURATION ─────────────────────────────────────────────────────────────
+LI_AT_COOKIE         = os.environ.get("LINKEDIN_LI_AT", "")
 LINKEDIN_PROFILE_URL = os.environ.get("LINKEDIN_PROFILE_URL", "")
+
+# For auto-refresh: a GitHub Personal Access Token with repo scope
+# This lets the scraper update the LINKEDIN_LI_AT secret automatically
+GH_PAT            = os.environ.get("GH_PAT", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # auto-set by GitHub Actions
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TIMEOUT = 60_000  # ms
 
+
+# ═══════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════
 
 def human_delay(min_s: float = 2.0, max_s: float = 5.0) -> None:
     time.sleep(random.uniform(min_s, max_s))
@@ -25,10 +36,10 @@ def scroll_slowly(page, steps: int = 5) -> None:
         human_delay(1.5, 3.0)
 
 
-def save_debug_screenshot(page, name: str = "debug") -> None:
+def save_debug_screenshot(page, name: str) -> None:
     try:
         page.screenshot(path=f"{name}.png", full_page=True)
-        print(f"   📸 Screenshot: {name}.png")
+        print(f"   📸 {name}.png")
     except Exception as e:
         print(f"   ⚠️  Screenshot failed: {e}")
 
@@ -41,188 +52,124 @@ def print_page_info(page, label: str = "") -> None:
         pass
 
 
-def fill_login_form(page) -> None:
+# ═══════════════════════════════════════════════════════════════
+# GITHUB SECRET AUTO-REFRESH
+# ═══════════════════════════════════════════════════════════════
+
+def _encrypt_secret_for_github(public_key_b64: str, secret_value: str) -> str:
     """
-    Fill the LinkedIn login form.
-    Uses label/placeholder selectors that match LinkedIn's current (2024-2025) login page design
-    which shows 'Email or phone' and 'Password' labels — the old id='username' is gone.
+    Encrypt a secret value using the repo's public key.
+    Required by GitHub API before updating a secret.
     """
-
-    # ── Email field ────────────────────────────────────────────────────────────
-    # Try in order: get_by_label (most reliable), get_by_placeholder, CSS fallbacks
-    email_locator = None
-
-    # Strategy 1: by visible label text (matches the 'Email or phone' label)
-    try:
-        loc = page.get_by_label("Email or phone")
-        loc.wait_for(state="visible", timeout=15_000)
-        email_locator = loc
-        print("   ✅ Email field found via label 'Email or phone'")
-    except Exception:
-        pass
-
-    # Strategy 2: by placeholder
-    if not email_locator:
-        try:
-            loc = page.get_by_placeholder("Email or phone")
-            loc.wait_for(state="visible", timeout=8_000)
-            email_locator = loc
-            print("   ✅ Email field found via placeholder")
-        except Exception:
-            pass
-
-    # Strategy 3: CSS selectors (old + new)
-    if not email_locator:
-        css_selectors = [
-            "#username",
-            "input[name='session_key']",
-            "input[autocomplete='username']",
-            "input[type='email']",
-            "input[type='text']",
-            "form input:not([type='password']):not([type='hidden'])",
-        ]
-        for sel in css_selectors:
-            try:
-                page.wait_for_selector(sel, state="visible", timeout=6_000)
-                email_locator = page.locator(sel).first
-                print(f"   ✅ Email field found via CSS: {sel}")
-                break
-            except PWTimeout:
-                print(f"   — CSS selector missed: {sel}")
-                continue
-
-    if not email_locator:
-        save_debug_screenshot(page, "email_field_not_found")
-        raise RuntimeError(
-            "❌ Could not find the email/phone input field.\n"
-            "See email_field_not_found.png for what the browser showed."
-        )
-
-    print("   Typing email …")
-    email_locator.click()
-    human_delay(0.5, 1.0)
-    email_locator.type(LINKEDIN_EMAIL, delay=random.randint(60, 130))
-    human_delay(1.0, 2.0)
-
-    # ── Password field ─────────────────────────────────────────────────────────
-    password_locator = None
-
-    try:
-        loc = page.get_by_label("Password")
-        loc.wait_for(state="visible", timeout=8_000)
-        password_locator = loc
-        print("   ✅ Password field found via label 'Password'")
-    except Exception:
-        pass
-
-    if not password_locator:
-        pw_selectors = [
-            "input[type='password']",
-            "#password",
-            "input[name='session_password']",
-            "input[autocomplete='current-password']",
-        ]
-        for sel in pw_selectors:
-            try:
-                page.wait_for_selector(sel, state="visible", timeout=6_000)
-                password_locator = page.locator(sel).first
-                print(f"   ✅ Password field found via CSS: {sel}")
-                break
-            except PWTimeout:
-                continue
-
-    if not password_locator:
-        save_debug_screenshot(page, "password_field_not_found")
-        raise RuntimeError("❌ Could not find the password input field.")
-
-    print("   Typing password …")
-    password_locator.click()
-    human_delay(0.5, 1.0)
-    password_locator.type(LINKEDIN_PASSWORD, delay=random.randint(60, 130))
-    human_delay(1.0, 2.0)
-
-    # ── Submit button ──────────────────────────────────────────────────────────
-    print("   Clicking Sign in …")
-    submitted = False
-
-    # Try 'Sign in' button by text first (most reliable on new layout)
-    try:
-        btn = page.get_by_role("button", name="Sign in")
-        if btn.is_visible(timeout=5_000):
-            btn.click()
-            submitted = True
-            print("   ✅ Clicked 'Sign in' button via role+name")
-    except Exception:
-        pass
-
-    if not submitted:
-        submit_selectors = [
-            "button[type='submit']",
-            "button[data-litms-control-urn='login-submit']",
-            ".login__form_action_container button",
-            "button:has-text('Sign in')",
-        ]
-        for sel in submit_selectors:
-            try:
-                btn = page.locator(sel).first
-                if btn.is_visible(timeout=4_000):
-                    btn.click()
-                    submitted = True
-                    break
-            except Exception:
-                continue
-
-    if not submitted:
-        print("   ⚠️  No submit button found — pressing Enter as fallback")
-        page.keyboard.press("Enter")
+    pk = nacl_public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = nacl_public.SealedBox(pk)
+    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("utf-8")
 
 
-def do_login(page) -> None:
-    """Navigate to LinkedIn login page and authenticate."""
+def refresh_github_secret(secret_name: str, new_value: str) -> bool:
+    """
+    Update a GitHub Actions secret via the GitHub API.
+    Requires GH_PAT (Personal Access Token) with repo scope.
+    Returns True on success, False on failure.
+    """
+    if not GH_PAT or not GITHUB_REPOSITORY:
+        print("   ⚠️  GH_PAT or GITHUB_REPOSITORY not set — skipping auto-refresh")
+        return False
 
-    print("   Opening LinkedIn login page …")
-    page.goto(
-        "https://www.linkedin.com/login",
-        wait_until="load",
-        timeout=DEFAULT_TIMEOUT,
+    headers = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets"
+
+    # Step 1: Get repo public key (needed to encrypt the secret)
+    key_resp = requests.get(f"{base_url}/public-key", headers=headers, timeout=10)
+    if key_resp.status_code != 200:
+        print(f"   ⚠️  Could not fetch GitHub public key: {key_resp.status_code}")
+        return False
+
+    key_data      = key_resp.json()
+    encrypted_val = _encrypt_secret_for_github(key_data["key"], new_value)
+
+    # Step 2: Push the updated secret
+    put_resp = requests.put(
+        f"{base_url}/{secret_name}",
+        headers=headers,
+        json={"encrypted_value": encrypted_val, "key_id": key_data["key_id"]},
+        timeout=10,
     )
-    human_delay(4, 6)
-    print_page_info(page, "login-page")
-    save_debug_screenshot(page, "01_login_page_loaded")
 
-    # If already redirected to feed, we're already logged in
-    if "feed" in page.url or "mynetwork" in page.url:
-        print("   ✅ Already logged in!")
-        return
+    if put_resp.status_code in (201, 204):
+        print(f"   ✅ GitHub Secret '{secret_name}' updated automatically")
+        return True
+    else:
+        print(f"   ⚠️  Secret update failed: {put_resp.status_code} — {put_resp.text}")
+        return False
 
-    # Fill credentials
-    fill_login_form(page)
 
-    # Wait for post-login navigation
-    print("   Waiting for post-login redirect …")
-    page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT)
-    human_delay(5, 8)
-    print_page_info(page, "post-login")
-    save_debug_screenshot(page, "02_post_login")
+def extract_fresh_li_at(context) -> str:
+    """
+    After scraping, read the current li_at cookie value from the browser.
+    LinkedIn often refreshes/extends the cookie on each use —
+    we capture the latest value and save it back to GitHub Secrets.
+    """
+    cookies = context.cookies()
+    for c in cookies:
+        if c["name"] == "li_at" and "linkedin.com" in c.get("domain", ""):
+            return c["value"]
+    return ""
 
-    # Evaluate result
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION
+# ═══════════════════════════════════════════════════════════════
+
+def inject_session_cookie(context) -> None:
+    """Inject li_at directly — bypasses login form and CAPTCHA entirely."""
+    context.add_cookies([
+        {
+            "name":     "li_at",
+            "value":    LI_AT_COOKIE,
+            "domain":   ".linkedin.com",
+            "path":     "/",
+            "httpOnly": True,
+            "secure":   True,
+            "sameSite": "None",
+        }
+    ])
+    print("   ✅ Session cookie injected (no login form, no CAPTCHA)")
+
+
+def verify_session(page) -> None:
+    """Verify the injected session is still valid."""
+    print("   Verifying session …")
+    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+    human_delay(3, 5)
+    print_page_info(page, "session-check")
+    save_debug_screenshot(page, "01_session_check")
+
     url = page.url
-    if "checkpoint" in url or "challenge" in url:
+    if "login" in url or "authwall" in url or "signup" in url:
         raise RuntimeError(
-            "🚫 LinkedIn security checkpoint (phone/email verification required).\n"
-            "Log into this LinkedIn account manually in a real browser, "
-            "complete the verification once, then re-run the GitHub Action."
+            "❌ LinkedIn session cookie has expired.\n\n"
+            "To get a fresh cookie (takes ~2 minutes):\n"
+            "  1. Open Chrome → linkedin.com → log in\n"
+            "  2. Press F12 → Application tab → Cookies → linkedin.com\n"
+            "  3. Find 'li_at' → copy its Value\n"
+            "  4. Go to GitHub repo → Settings → Secrets → Actions\n"
+            "  5. Update LINKEDIN_LI_AT with the new value\n\n"
+            "Note: With 'Keep me signed in' checked, the cookie typically "
+            "lasts 12+ months. The scraper also auto-refreshes it daily via GH_PAT."
         )
 
-    if "login" in url and "feed" not in url:
-        save_debug_screenshot(page, "02b_login_failed")
-        raise RuntimeError(
-            "❌ Still on login page after submitting. "
-            "Check credentials in GitHub Secrets (LINKEDIN_EMAIL / LINKEDIN_PASSWORD)."
-        )
+    print("   ✅ Session valid — logged in!")
 
-    print("   ✅ Login successful!")
 
+# ═══════════════════════════════════════════════════════════════
+# SCRAPING
+# ═══════════════════════════════════════════════════════════════
 
 def extract_posts(page) -> list[dict]:
     posts = []
@@ -232,7 +179,6 @@ def extract_posts(page) -> list[dict]:
         ".occludable-update",
         "[data-urn*='activity']",
         ".profile-creator-shared-feed-update__container",
-        ".ember-view.occludable-update",
     ]
 
     post_elements = []
@@ -245,16 +191,15 @@ def extract_posts(page) -> list[dict]:
                 break
         except PWTimeout:
             print(f"   — Post selector not found: {sel}")
-            continue
 
     if not post_elements:
         save_debug_screenshot(page, "04_no_posts_found")
-        print("   ⚠️  No post elements found — see 04_no_posts_found.png")
+        print("   ⚠️  No post elements found — check 04_no_posts_found.png")
         return posts
 
     for el in post_elements[:14]:
         try:
-            # Skip sponsored posts
+            # Skip sponsored
             sponsored = el.query_selector(".feed-shared-actor__sub-description")
             if sponsored and "promoted" in (sponsored.inner_text() or "").lower():
                 continue
@@ -292,20 +237,22 @@ def extract_posts(page) -> list[dict]:
 
         except Exception as e:
             print(f"   ⚠️  Skipping post: {e}")
-            continue
 
     return posts
 
 
-def scrape() -> None:
-    if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD or not LINKEDIN_PROFILE_URL:
-        raise ValueError(
-            "Missing env vars. Set LINKEDIN_EMAIL, LINKEDIN_PASSWORD, "
-            "LINKEDIN_PROFILE_URL in GitHub Secrets."
-        )
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 
-    print("🚀 Starting LinkedIn scraper …")
-    print(f"   Target profile: {LINKEDIN_PROFILE_URL}")
+def scrape() -> None:
+    if not LI_AT_COOKIE:
+        raise ValueError("LINKEDIN_LI_AT secret is not set. See setup instructions.")
+    if not LINKEDIN_PROFILE_URL:
+        raise ValueError("LINKEDIN_PROFILE_URL secret is not set.")
+
+    print("🚀 Starting LinkedIn scraper (cookie auth + auto-refresh) …")
+    print(f"   Target: {LINKEDIN_PROFILE_URL}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -334,28 +281,45 @@ def scrape() -> None:
         )
         context.set_default_timeout(DEFAULT_TIMEOUT)
 
+        # ── 1. Inject cookie (no login/CAPTCHA) ───────────────────────────────
+        inject_session_cookie(context)
+
         page = context.new_page()
         stealth_sync(page)
 
+        posts = []
         try:
-            # ── STEP 1: Login ──────────────────────────────────────────────────
-            do_login(page)
+            # ── 2. Verify session ─────────────────────────────────────────────
+            verify_session(page)
 
-            # ── STEP 2: Navigate to client profile ────────────────────────────
+            # ── 3. Navigate to client profile ─────────────────────────────────
             print(f"\n   Navigating to: {LINKEDIN_PROFILE_URL}")
             page.goto(LINKEDIN_PROFILE_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
             human_delay(4, 7)
             print_page_info(page, "profile")
-            save_debug_screenshot(page, "03_profile_page")
+            save_debug_screenshot(page, "02_profile_page")
 
-            # ── STEP 3: Scroll to load posts ───────────────────────────────────
+            # ── 4. Scroll to trigger lazy-load ────────────────────────────────
             print("   Scrolling to load posts …")
             scroll_slowly(page, steps=5)
-            save_debug_screenshot(page, "03b_after_scroll")
+            save_debug_screenshot(page, "03_after_scroll")
 
-            # ── STEP 4: Extract posts ──────────────────────────────────────────
+            # ── 5. Extract posts ──────────────────────────────────────────────
             print("   Extracting posts …")
             posts = extract_posts(page)
+
+            # ── 6. Auto-refresh the cookie in GitHub Secrets ──────────────────
+            # After a successful scrape, LinkedIn may have issued a refreshed cookie.
+            # We capture it and push it back to GitHub so the secret never expires.
+            print("\n   Checking for refreshed session cookie …")
+            fresh_li_at = extract_fresh_li_at(context)
+            if fresh_li_at and fresh_li_at != LI_AT_COOKIE:
+                print("   🔄 Cookie was refreshed by LinkedIn — saving new value …")
+                refresh_github_secret("LINKEDIN_LI_AT", fresh_li_at)
+            elif fresh_li_at == LI_AT_COOKIE:
+                print("   ✅ Cookie unchanged — still fresh, no update needed")
+            else:
+                print("   ⚠️  Could not read fresh cookie from browser")
 
         except Exception as e:
             save_debug_screenshot(page, "error_state")
@@ -364,19 +328,18 @@ def scrape() -> None:
 
         browser.close()
 
-    # ── WRITE OUTPUT ───────────────────────────────────────────────────────────
+    # ── 7. Write posts.json ────────────────────────────────────────────────────
     output = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "post_count": len(posts),
         "posts":      posts,
     }
-
     with open("posts.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"\n✅ Done! Scraped {len(posts)} posts → posts.json")
     if len(posts) == 0:
-        print("⚠️  0 posts scraped — check screenshots in debug-screenshots artifact.")
+        print("⚠️  0 posts scraped — check debug screenshots in artifacts.")
 
 
 if __name__ == "__main__":
